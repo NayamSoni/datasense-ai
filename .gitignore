@@ -1,0 +1,31 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# VS Code settings
+.vscode/
+
+# macOS-generated files
+.DS_Store
+
+# Runtime-generated memory and user data
+memory/
+
+# Logs and temporary files
+*.log
+*.tmp
+
+# User-uploaded datasets
+uploads/
