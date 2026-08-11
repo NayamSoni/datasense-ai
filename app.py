@@ -41,6 +41,7 @@ from predictive_modeling import (
     render_data_science_lab,
     render_data_science_lab_intro,
 )
+from database_connector import load_demo_sales
 
 try:
     from streamlit_sortables import sort_items
@@ -48,7 +49,7 @@ try:
 except ImportError:
     SORTABLES_AVAILABLE = False
 
-APP_BUILD = "2026.07.30-DATA-SCIENCE-LAB-UI-R3"
+APP_BUILD = "2026.08.11-DATABASE-OUTPUT-R2"
 print(f"### APP.PY LOADED - DATASENSE AI {APP_BUILD} ###")
 print(f"### SORTABLES_AVAILABLE = {SORTABLES_AVAILABLE} ###")
 
@@ -98,19 +99,13 @@ DATASET_SESSION_KEYS = (
     "last_analysis_question",
     "pending_feedback_rule",
     "cleaning_log",
+    "active_dataset_source",
+    "database_last_refreshed_at",
 )
 
 
-def handle_dataset_uploader_change() -> None:
-    """Persist a new upload, or clear dataset state when its X is clicked."""
-    current_file = st.session_state.get("dataset_uploader")
-
-    if current_file is not None:
-        st.session_state.uploaded_file_bytes = current_file.getvalue()
-        st.session_state.uploaded_file_name = current_file.name
-        st.session_state.uploaded_file_size = current_file.size
-        return
-
+def clear_active_dataset_state() -> None:
+    """Clear the active dataset and every result derived from it."""
     for key in DATASET_SESSION_KEYS:
         st.session_state.pop(key, None)
 
@@ -126,6 +121,53 @@ def handle_dataset_uploader_change() -> None:
                 "predictive_result_",
             )
         ):
+            st.session_state.pop(key, None)
+
+
+def handle_dataset_uploader_change() -> None:
+    """Persist a new upload, or clear dataset state when its X is clicked."""
+    current_file = st.session_state.get("dataset_uploader")
+
+    if current_file is not None:
+        st.session_state.uploaded_file_bytes = current_file.getvalue()
+        st.session_state.uploaded_file_name = current_file.name
+        st.session_state.uploaded_file_size = current_file.size
+        return
+
+    clear_active_dataset_state()
+
+
+def handle_dataset_source_change() -> None:
+    """Reset derived results when the user switches between file and SQL."""
+    st.session_state.pop("dataset_uploader", None)
+    clear_active_dataset_state()
+
+
+def dataframe_dataset_id(df: pd.DataFrame, source: str) -> str:
+    """Create a stable ID that changes when database values or schema change."""
+    schema = "|".join(f"{column}:{dtype}" for column, dtype in df.dtypes.items())
+    values = pd.util.hash_pandas_object(df, index=True).values.tobytes()
+    digest = hashlib.sha256(schema.encode("utf-8") + values).hexdigest()[:16]
+    return f"{source}-{digest}"
+
+
+def activate_dataset(loaded_df: pd.DataFrame, dataset_id: str, source: str) -> None:
+    """Make a newly loaded file or database snapshot the active dataset."""
+    if st.session_state.get("active_dataset_id") == dataset_id:
+        return
+
+    st.session_state.active_dataset_id = dataset_id
+    st.session_state.active_dataset_source = source
+    st.session_state.original_df = loaded_df.copy()
+    st.session_state.active_df = loaded_df.copy()
+    st.session_state.messages = []
+    st.session_state.last_analysis_plan = None
+    st.session_state.last_analysis_question = None
+    st.session_state.pending_feedback_rule = None
+    st.session_state.cleaning_log = []
+
+    for key in list(st.session_state):
+        if str(key).startswith("predictive_result_"):
             st.session_state.pop(key, None)
 
 
@@ -159,6 +201,9 @@ st.set_page_config(
 )
 
 load_theme()
+
+if "dataset_source_mode" not in st.session_state:
+    st.session_state.dataset_source_mode = "Upload CSV / Excel"
 
 # One restrained typography scale keeps every surface readable and makes the
 # interface feel like a single business product.
@@ -393,13 +438,19 @@ with st.sidebar:
     else:
         st.caption("No conversations yet")
 
+    source_status = (
+        "Supabase source · Local AI"
+        if st.session_state.get("dataset_source_mode") == "Demo database"
+        else "File source · Local AI"
+    )
+
     st.markdown(
-        """
+        f"""
         <div class="system-status">
             <span class="status-dot"></span>
             <div>
                 <strong>Local AI online</strong>
-                <small>Your data stays on this device</small>
+                <small>{source_status}</small>
             </div>
         </div>
         """,
@@ -474,145 +525,159 @@ if "messages" not in st.session_state:
 
 
 # ==========================================================
-# FILE UPLOAD
+# DATA SOURCE - FILE OR SUPABASE
 # ==========================================================
 
 if st.session_state.nav_active == "Data Science Lab":
     render_data_science_lab_intro()
 
-    st.markdown(
-        """
-        <style>
-        .st-key-dataset_uploader {
-            max-width: 620px;
-            margin: 0 auto 0.65rem;
-        }
-        .st-key-dataset_uploader [data-testid="stFileUploaderDropzone"] {
-            min-height: 66px !important;
-            padding: 0.55rem 0.85rem !important;
-            border: 1px solid rgba(71, 184, 255, 0.42) !important;
-            border-radius: 13px !important;
-            background:
-                linear-gradient(
-                    105deg,
-                    rgba(10, 48, 104, 0.82),
-                    rgba(5, 28, 67, 0.90)
-                ) !important;
-        }
-        .st-key-dataset_uploader
-        [data-testid="stFileUploaderDropzoneInstructions"] {
-            padding: 0 !important;
-        }
-        .st-key-dataset_uploader
-        [data-testid="stFileUploaderDropzoneInstructions"] > div > span {
-            font-size: 0.82rem !important;
-            color: #d8edff !important;
-        }
-        .st-key-dataset_uploader
-        [data-testid="stFileUploaderDropzoneInstructions"] > div > small {
-            display: none !important;
-        }
-        .st-key-dataset_uploader button {
-            min-height: 34px !important;
-            padding: 0.3rem 0.85rem !important;
-            border: 1px solid rgba(78, 202, 255, 0.55) !important;
-            background: rgba(0, 116, 217, 0.22) !important;
-            color: #e8f8ff !important;
-        }
-        .ds-lab-upload-label {
-            max-width: 620px;
-            margin: 0 auto 0.42rem;
-            color: #7fcfff;
-            font-size: 0.70rem;
-            font-weight: 800;
-            letter-spacing: 0.10em;
-            text-transform: uppercase;
-        }
-        </style>
-        <div class="ds-lab-upload-label">Dataset · CSV or Excel</div>
-        """,
-        unsafe_allow_html=True,
-    )
-else:
-    st.markdown(
-        """
-        <div class="upload-animation" aria-hidden="true">
-            <div class="animated-file"><span>CSV</span></div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-# FIX: an empty string "" label (even with label_visibility=
-# "collapsed") still triggers Streamlit's "label got an empty
-# value" accessibility warning on every rerun - that is what was
-# spamming the terminal. A real label + collapsed visibility gets
-# the same visual result without the warning.
-uploaded_file = st.file_uploader(
-    "Upload dataset",
-    type=["csv", "xlsx"],
+st.markdown("### Choose a data source")
+st.radio(
+    "Data source",
+    options=["Upload CSV / Excel", "Demo database"],
+    horizontal=True,
     label_visibility="collapsed",
-    key="dataset_uploader",
-    on_change=handle_dataset_uploader_change,
+    key="dataset_source_mode",
+    on_change=handle_dataset_source_change,
 )
 
+using_database = st.session_state.dataset_source_mode == "Demo database"
 
-# The uploader widget is not the dataset's source of truth. Streamlit can
-# temporarily return None while widgets are rebuilt during navigation, so keep
-# the bytes and metadata in session state and restore them on the next page.
-if uploaded_file is not None:
-    file_bytes = uploaded_file.getvalue()
-    uploaded_file_name = uploaded_file.name
-    uploaded_file_size = uploaded_file.size
-    st.session_state.uploaded_file_bytes = file_bytes
-    st.session_state.uploaded_file_name = uploaded_file_name
-    st.session_state.uploaded_file_size = uploaded_file_size
-elif st.session_state.get("uploaded_file_bytes") is not None:
-    file_bytes = st.session_state.uploaded_file_bytes
-    uploaded_file_name = st.session_state.uploaded_file_name
-    uploaded_file_size = st.session_state.uploaded_file_size
+if using_database:
+    source_col, refresh_col = st.columns([5, 1])
+    with source_col:
+        st.markdown("**Supabase PostgreSQL · `public.demo_sales`**")
+        st.caption("Cloud data is loaded into the existing DataSense AI analysis pipeline.")
+    with refresh_col:
+        st.button(
+            "Refresh data",
+            key="refresh_demo_database",
+            use_container_width=True,
+            icon=":material/refresh:",
+        )
+
+    try:
+        database_df = load_demo_sales()
+        dataset_id = dataframe_dataset_id(database_df, "supabase-demo-sales")
+        activate_dataset(database_df, dataset_id, "Supabase PostgreSQL")
+
+        df = st.session_state.active_df.copy()
+        uploaded_file_name = "Supabase · public.demo_sales"
+        uploaded_file_size = int(database_df.memory_usage(deep=True).sum())
+        dataset_source_label = "Database"
+        st.session_state.database_last_refreshed_at = pd.Timestamp.now().strftime(
+            "%d %b %Y, %I:%M:%S %p"
+        )
+        st.success(f"Connected · {len(database_df):,} rows loaded")
+        st.caption(
+            "Last checked: "
+            f"{st.session_state.database_last_refreshed_at} · Click Refresh data after changing Supabase."
+        )
+    except Exception as e:
+        st.error(
+            "Could not connect to Supabase. Check `.streamlit/secrets.toml` "
+            f"and your network connection. Details: {e}"
+        )
+        st.stop()
+
 else:
     if st.session_state.nav_active == "Data Science Lab":
-        render_data_science_lab(
-            None,
-            "no-dataset",
-            show_intro=False,
+        st.markdown(
+            """
+            <style>
+            .st-key-dataset_uploader {
+                max-width: 620px;
+                margin: 0 auto 0.65rem;
+            }
+            .st-key-dataset_uploader [data-testid="stFileUploaderDropzone"] {
+                min-height: 66px !important;
+                padding: 0.55rem 0.85rem !important;
+                border: 1px solid rgba(71, 184, 255, 0.42) !important;
+                border-radius: 13px !important;
+                background:
+                    linear-gradient(
+                        105deg,
+                        rgba(10, 48, 104, 0.82),
+                        rgba(5, 28, 67, 0.90)
+                    ) !important;
+            }
+            .st-key-dataset_uploader
+            [data-testid="stFileUploaderDropzoneInstructions"] {
+                padding: 0 !important;
+            }
+            .st-key-dataset_uploader
+            [data-testid="stFileUploaderDropzoneInstructions"] > div > span {
+                font-size: 0.82rem !important;
+                color: #d8edff !important;
+            }
+            .st-key-dataset_uploader
+            [data-testid="stFileUploaderDropzoneInstructions"] > div > small {
+                display: none !important;
+            }
+            .st-key-dataset_uploader button {
+                min-height: 34px !important;
+                padding: 0.3rem 0.85rem !important;
+                border: 1px solid rgba(78, 202, 255, 0.55) !important;
+                background: rgba(0, 116, 217, 0.22) !important;
+                color: #e8f8ff !important;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
         )
-    st.stop()
+    else:
+        st.markdown(
+            """
+            <div class="upload-animation" aria-hidden="true">
+                <div class="animated-file"><span>CSV</span></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
+    uploaded_file = st.file_uploader(
+        "Upload dataset",
+        type=["csv", "xlsx"],
+        label_visibility="collapsed",
+        key="dataset_uploader",
+        on_change=handle_dataset_uploader_change,
+    )
 
-# ==========================================================
-# LOAD DATA
-# ==========================================================
+    # The uploader widget is not the dataset's source of truth. Streamlit can
+    # temporarily return None during navigation, so persist its bytes.
+    if uploaded_file is not None:
+        file_bytes = uploaded_file.getvalue()
+        uploaded_file_name = uploaded_file.name
+        uploaded_file_size = uploaded_file.size
+        st.session_state.uploaded_file_bytes = file_bytes
+        st.session_state.uploaded_file_name = uploaded_file_name
+        st.session_state.uploaded_file_size = uploaded_file_size
+    elif st.session_state.get("uploaded_file_bytes") is not None:
+        file_bytes = st.session_state.uploaded_file_bytes
+        uploaded_file_name = st.session_state.uploaded_file_name
+        uploaded_file_size = st.session_state.uploaded_file_size
+    else:
+        if st.session_state.nav_active == "Data Science Lab":
+            render_data_science_lab(None, "no-dataset", show_intro=False)
+        st.stop()
 
-dataset_id = hashlib.sha256(file_bytes).hexdigest()[:16]
+    dataset_id = f"file-{hashlib.sha256(file_bytes).hexdigest()[:16]}"
 
-try:
-    # Keep an untouched copy plus the active working copy. Cleaning changes
-    # only the working copy and survives Streamlit reruns for this dataset.
-    if st.session_state.get("active_dataset_id") != dataset_id:
-        if uploaded_file_name.lower().endswith(".csv"):
-            loaded_df = pd.read_csv(BytesIO(file_bytes))
-        else:
-            loaded_df = pd.read_excel(BytesIO(file_bytes))
+    try:
+        if st.session_state.get("active_dataset_id") != dataset_id:
+            if uploaded_file_name.lower().endswith(".csv"):
+                loaded_df = pd.read_csv(BytesIO(file_bytes))
+            else:
+                loaded_df = pd.read_excel(BytesIO(file_bytes))
 
-        st.session_state.active_dataset_id = dataset_id
-        st.session_state.original_df = loaded_df.copy()
-        st.session_state.active_df = loaded_df.copy()
-        st.session_state.messages = []
-        st.session_state.last_analysis_plan = None
-        st.session_state.last_analysis_question = None
-        st.session_state.pending_feedback_rule = None
-        st.session_state.cleaning_log = []
-        for key in list(st.session_state):
-            if str(key).startswith("predictive_result_"):
-                st.session_state.pop(key, None)
+            activate_dataset(loaded_df, dataset_id, "Uploaded file")
 
-    df = st.session_state.active_df.copy()
+        df = st.session_state.active_df.copy()
+        dataset_source_label = "Uploaded file"
 
-except Exception as e:
-    st.error(f"Could not read the uploaded file: {e}")
-    st.stop()
+    except Exception as e:
+        st.error(f"Could not read the uploaded file: {e}")
+        st.stop()
 
 
 rows, columns = df.shape
@@ -1111,7 +1176,7 @@ st.markdown(
                 <div class="dataset-card-meta">{rows:,} rows &nbsp;&middot;&nbsp; {columns} columns &nbsp;&middot;&nbsp; {file_size_mb:.2f} MB</div>
             </div>
         </div>
-        <div class="dataset-card-badge">Loaded</div>
+        <div class="dataset-card-badge">{dataset_source_label}</div>
     </div>
     """,
     unsafe_allow_html=True
@@ -1167,10 +1232,11 @@ with panel1:
         f"""
         <div class="panel-card">
             <div class="panel-title">Dataset Overview</div>
-            <div class="panel-row"><span class="panel-row-label">File Name</span><span class="panel-row-value">{uploaded_file_name}</span></div>
+            <div class="panel-row"><span class="panel-row-label">Source Name</span><span class="panel-row-value">{uploaded_file_name}</span></div>
+            <div class="panel-row"><span class="panel-row-label">Source Type</span><span class="panel-row-value">{dataset_source_label}</span></div>
             <div class="panel-row"><span class="panel-row-label">Rows</span><span class="panel-row-value">{rows:,}</span></div>
             <div class="panel-row"><span class="panel-row-label">Columns</span><span class="panel-row-value">{columns}</span></div>
-            <div class="panel-row"><span class="panel-row-label">File Size</span><span class="panel-row-value">{file_size_mb:.2f} MB</span></div>
+            <div class="panel-row"><span class="panel-row-label">Data Size</span><span class="panel-row-value">{file_size_mb:.2f} MB</span></div>
         </div>
         """,
         unsafe_allow_html=True
@@ -1261,13 +1327,25 @@ question = st.session_state.pop("pending_question", None)
 # ANALYSIS MESSAGE RENDERER
 # ==========================================================
 
+def display_column_name(column) -> str:
+    """Humanize machine-friendly dataset column names for result tables."""
+    label = str(column).replace("_", " ").strip()
+    return label.title() if label == label.lower() else label
+
+
 def render_dataframe_message(message, fallback_key):
     """Render a saved calculation with a persistent Normal/3D chart choice."""
     result_frame = message["content"]
     plan = message.get("plan")
 
     if plan:
-        st.markdown(f"### {plan.get('title', 'Analysis')}")
+        analysis_title = str(plan.get("title", "Analysis"))
+        if plan.get("analysis_type") == "top_bottom" and plan.get("measure"):
+            measure_label = display_column_name(plan["measure"])
+            if measure_label.lower() not in analysis_title.lower():
+                analysis_title = f"{analysis_title} by {measure_label}"
+
+        st.markdown(f"### {analysis_title}")
 
         if (
             plan.get("analysis_type") == "average_order_value"
@@ -1315,7 +1393,8 @@ def render_dataframe_message(message, fallback_key):
             chart_source = message.get("chart_data", result_frame)
             render_chart(chart_source, display_plan)
 
-    st.dataframe(result_frame, use_container_width=True)
+    display_frame = result_frame.rename(columns=display_column_name)
+    st.dataframe(display_frame, use_container_width=True, hide_index=True)
 
 
 # ==========================================================

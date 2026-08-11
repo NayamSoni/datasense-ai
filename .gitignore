@@ -29,3 +29,5 @@ memory/
 
 # User-uploaded datasets
 uploads/
+
+.streamlit/secrets.toml

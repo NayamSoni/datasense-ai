@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 
-print("### PANDAS_AGENT.PY LOADED — VERSION 2026-07-21-v7 (Average Order Value calculation) ###")
+print("### PANDAS_AGENT.PY LOADED — VERSION 2026-08-11-v8 (Focused ranking output) ###")
 
 from utils import detect_date_column
 
@@ -326,8 +326,6 @@ def add_business_metrics(result, measure):
 
     result = add_contribution(result, measure)
 
-    result = add_running_total(result, measure)
-
     return result
 
 
@@ -410,19 +408,17 @@ def top_bottom_analysis(
 
     )
 
+    # Calculate share against every category before applying Top/Bottom N.
+    # Otherwise the displayed subset would incorrectly add up to 100%.
+    result = add_contribution(result, measure)
+
     if limit:
 
         result = result.head(limit)
 
-    result = add_business_metrics(
+    result = add_rank(result)
 
-        result,
-
-        measure
-
-    )
-
-    result = _finalize_measure_columns(result, [measure, "Running Total"])
+    result = _finalize_measure_columns(result, [measure])
 
     return result.reset_index(drop=True)
 
@@ -914,19 +910,13 @@ def pareto_analysis(
 
     total = result[measure].sum()
 
-    result["Contribution %"] = (
+    contribution = result[measure] / total * 100
 
-        result[measure]
-
-        / total
-
-        * 100
-
-    ).round(2)
+    result["Contribution %"] = contribution.round(2)
 
     result["Cumulative %"] = (
 
-        result["Contribution %"]
+        contribution
 
         .cumsum()
 
@@ -1186,22 +1176,23 @@ def calculate(df, plan):
 
     )
 
+    # Calculate contribution against the complete breakdown before applying
+    # Top/Bottom N, then rank only the rows that will be displayed.
+    if group_by:
+
+        result = add_contribution(result, measure)
+
     if limit:
 
         result = result.head(limit)
 
-    # Rank, contribution and running total are meaningful for a breakdown,
-    # not for a single overall KPI such as Total Sales or Average Sales.
+    # Rank and contribution make an ordinary category breakdown easier to
+    # interpret. Running totals are reserved for explicit Pareto analysis,
+    # where the engine returns Cumulative % instead.
     if group_by:
 
-        result = add_business_metrics(
+        result = add_rank(result)
 
-            result,
-
-            measure
-
-        )
-
-    result = _finalize_measure_columns(result, [measure, "Running Total"])
+    result = _finalize_measure_columns(result, [measure])
 
     return result
