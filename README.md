@@ -1,198 +1,255 @@
-# DataSense AI
+# DataSense AI — Version 2
 
-A local-first AI data analyst built with Streamlit, Pandas, Altair, Plotly, and Ollama.
+> An agentic data analyst that turns structured data into quality checks, calculations, visualisations, business insights, and predictive models.
 
-DataSense AI allows users to upload CSV or Excel datasets, assess data quality, perform calculation-backed analysis, create visualisations, and receive evidence-linked business insights through natural-language questions.
+DataSense AI is a Streamlit application built to behave less like a generic chatbot and more like a practical data analyst. It combines deterministic Python/Pandas calculations with a local Ollama model for interpretation and conversational guidance.
 
-> **Project status:** Version 2 runs locally using Ollama and `llama3.2:3b`. A cloud-hosted demo is not currently available.
+Users can analyse data from either:
 
-## Overview
+- CSV or Excel uploads
+- A live Supabase PostgreSQL demo table
 
-Business users often spend significant time checking data quality, creating calculations, selecting suitable charts, and translating analytical results into useful recommendations.
+When database rows change, DataSense AI can refresh the table and rerun the same analysis pipeline without another file upload.
 
-DataSense AI brings these activities into one guided workflow:
+## What it demonstrates
 
-1. Upload a CSV or Excel file.
-2. Review the dataset structure and health score.
-3. Investigate missing values, duplicates, outliers, and other quality issues.
-4. Apply user-selected cleaning actions.
-5. Ask analytical questions in natural language.
-6. Generate calculations, pivots, charts, insights, and recommendations.
+- Modular analytics application design
+- Natural-language intent detection and query planning
+- Calculation-backed answers instead of invented figures
+- Data quality profiling and user-controlled cleaning
+- Cloud PostgreSQL connectivity from Streamlit
+- Stateful follow-up analysis and learned corrections
+- Classification and regression workflows
+- Local LLM integration without a paid AI API
 
-The language model helps interpret questions and explain results, while Pandas performs the underlying calculations.
+## Current features
 
-## Key Features
+### Multiple data sources
 
-### Data quality and cleaning
+- Upload CSV and XLSX files
+- Connect to `public.demo_sales` in Supabase PostgreSQL
+- Refresh database data without restarting the application
+- Detect changed database content and clear stale analysis results
 
-* Detects missing values and affected rows
-* Identifies duplicate records
-* Detects potential outliers using the IQR method
-* Flags likely incorrect data types
-* Identifies constant columns
-* Highlights high-cardinality columns
-* Provides user-controlled cleaning actions
-* Maintains a cleaning audit log
-* Supports cleaned-data CSV export
+### Data quality
 
-### Dataset Health Score
+- Missing-value analysis
+- Duplicate detection
+- Type and consistency checks
+- IQR-based outlier detection
+- Constant and high-cardinality column checks
+- Dataset Health Score
+- Cleaning suggestions with an audit log
 
-Generates an overall diagnostic score using five measurable components:
+### Business analysis
 
-| Component           | Weight |
-| ------------------- | -----: |
-| Completeness        |    25% |
-| Consistency         |    20% |
-| Duplicate quality   |    20% |
-| Missing-row quality |    20% |
-| Outlier quality     |    15% |
+- KPI and statistical summaries
+- Aggregations, rankings, Top/Bottom analysis, and Pareto analysis
+- Contribution percentages calculated against the full breakdown
+- MoM and YoY analysis
+- Pivot, correlation, distribution, and outlier analysis
+- Calculation-grounded insights and recommendations
+- Editable decision reports with supporting charts
 
-```text
-Overall Health Score =
-25% Completeness
-+ 20% Consistency
-+ 20% Duplicate Quality
-+ 20% Missing-Row Quality
-+ 15% Outlier Quality
+### Conversational workspace
+
+- Intent detection and structured query planning
+- Follow-up question memory
+- Deterministic Pandas execution
+- Local Ollama reasoning
+- Experimental learned correction rules
+
+### Visualisation
+
+- Normal and 3D charts
+- Drag-and-drop visualisation shelves
+- User-controlled dimensions, measures, aggregations, colours, and Top N
+
+### Data Science Lab
+
+- Target selection
+- Automatic classification/regression detection
+- Dataset readiness checks
+- Train/test workflow
+- Model evaluation and understandable predictions
+
+## Architecture
+
+```mermaid
+flowchart TD
+    A[CSV / Excel] --> C[Pandas DataFrame]
+    B[Supabase PostgreSQL] --> C
+    C --> D[Profile and Quality Checks]
+    D --> E[Intent and Query Planning]
+    E --> F[Deterministic Pandas Execution]
+    F --> G[Insights, Charts, Reports]
+    F --> H[Data Science Lab]
+    G --> I[Local Ollama Interpretation]
 ```
 
-The score is diagnostic rather than prescriptive. Outliers, constant columns, and high-cardinality fields are not automatically treated as errors. The user decides whether they should be cleaned.
+The LLM helps interpret requests and explain results. Numerical calculations remain in Python/Pandas.
 
-### Calculation-backed analytics
+## Technology stack
 
-* Top and bottom performer analysis
-* Month-over-month analysis
-* Year-over-year analysis
-* Pivot-table generation
-* Correlation analysis
-* Distribution analysis
-* Outlier analysis
-* Pareto analysis
-* Drag-and-drop visualisation
-* Predictive modelling workspace
+- Python
+- Streamlit
+- Pandas and NumPy
+- Altair and Plotly
+- scikit-learn
+- Ollama with `llama3.2:3b`
+- PostgreSQL and Supabase
+- SQLAlchemy and Psycopg
+- pytest
 
-### Conversational analysis
+## Local setup
 
-DataSense AI retains the context of follow-up questions.
+### 1. Clone the repository
 
-For example:
-
-```text
-Show sales by region
-→ Only for 2023
-→ Now only California
+```bash
+git clone https://github.com/NayamSoni/datasense-ai.git
+cd datasense-ai
 ```
 
-The application carries the relevant metric, grouping, and filters into the subsequent analysis.
+### 2. Create and activate a virtual environment
 
-### Business insights
+macOS/Linux:
 
-* Generates insights from computed results
-* Links observations to supporting evidence
-* Identifies performance patterns and potential operational gaps
-* Presents recommendations as hypotheses to validate
-* Avoids presenting correlation as proven causation
-
-## Grounding Principle
-
-The LLM is used to interpret questions and produce general explanations. Pandas performs the actual calculations.
-
-Automatic insights and recommendations are generated only from computed evidence. Recommendations are presented as hypotheses requiring business validation rather than as confirmed causal conclusions.
-
-## Technology Stack
-
-| Technology   | Purpose                             |
-| ------------ | ----------------------------------- |
-| Python       | Core application development        |
-| Streamlit    | Interactive user interface          |
-| Pandas       | Data transformation and calculation |
-| NumPy        | Numerical operations                |
-| Altair       | Declarative visualisation           |
-| Plotly       | Interactive charts                  |
-| Scikit-learn | Predictive modelling                |
-| Ollama       | Local LLM execution                 |
-| Llama 3.2 3B | Question planning and explanations  |
-| OpenPyXL     | Excel-file support                  |
-
-## Project Structure
-
-```text
-datasense-ai/
-├── app.py
-├── conversation_memory.py
-├── data_quality.py
-├── feedback_memory.py
-├── insights_engine.py
-├── intent_agent.py
-├── llm_agent.py
-├── pandas_agent.py
-├── predictive_modeling.py
-├── prompts.py
-├── query_planner.py
-├── schema.py
-├── theme.py
-├── utils.py
-├── visualization.py
-├── styles.css
-├── requirements.txt
-├── README.md
-├── .gitignore
-├── .streamlit/
-│   └── config.toml
-├── assets/
-│   └── robot.png
-└── tests/
+```bash
+python -m venv venv
+source venv/bin/activate
 ```
 
-The robot image is optional. If `assets/robot.png` is unavailable, the application falls back to a robot emoji.
+Windows:
 
-## Running the Application Locally
+```powershell
+python -m venv venv
+venv\Scripts\activate
+```
 
-### 1. Install and prepare Ollama
+### 3. Install dependencies
 
-Install Ollama, start it locally, and download the required model:
+```bash
+pip install -r requirements.txt
+```
+
+### 4. Install the local AI model
+
+Install [Ollama](https://ollama.com/) and run:
 
 ```bash
 ollama pull llama3.2:3b
 ```
 
-### 2. Create a virtual environment
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-```
-
-### 3. Install the required packages
-
-```bash
-python -m pip install -r requirements.txt
-```
-
-### 4. Start the application
+### 5. Start DataSense AI
 
 ```bash
 streamlit run app.py
 ```
 
-The application will open in your browser.
+CSV/Excel analysis works without configuring Supabase.
 
-## Current Limitations
+## Optional Supabase database setup
 
-* Ollama must be installed and running on the user’s computer.
-* Response quality can vary because the application uses a lightweight local model.
-* Processing very large datasets may be limited by the computer’s available memory.
-* Generated recommendations require business review and domain validation.
-* Data-cleaning decisions remain under the user’s control.
+DataSense AI expects the demo database table at `public.demo_sales`.
 
-## Privacy
+### 1. Create a free Supabase project
 
-DataSense AI is designed as a local-first application. Dataset calculations and LLM inference run on the user’s machine through Pandas and Ollama rather than relying on a paid external LLM API.
+Create a project at [database.new](https://database.new/) and save its database password securely.
 
-## Future Improvements
+### 2. Create the sample table
 
-* Add a shareable hosted demonstration
-* Expand automated testing
-* Improve predictive-model evaluation and explainability
-* Add support for additional data sources
-* Strengthen analysis validation and error handling
+Run this once in the Supabase SQL Editor:
+
+```sql
+CREATE TABLE public.demo_sales (
+    order_id BIGINT PRIMARY KEY,
+    order_date DATE NOT NULL,
+    city TEXT NOT NULL,
+    product_category TEXT NOT NULL,
+    customer_segment TEXT NOT NULL,
+    units INTEGER NOT NULL,
+    unit_price NUMERIC(10, 2) NOT NULL,
+    discount_pct NUMERIC(5, 2) NOT NULL,
+    revenue NUMERIC(12, 2) NOT NULL,
+    profit NUMERIC(12, 2) NOT NULL,
+    returned BOOLEAN NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE public.demo_sales ENABLE ROW LEVEL SECURITY;
+
+INSERT INTO public.demo_sales (
+    order_id, order_date, city, product_category, customer_segment,
+    units, unit_price, discount_pct, revenue, profit, returned
+)
+VALUES
+    (1, CURRENT_DATE, 'Bengaluru', 'Electronics', 'Consumer', 12, 1499, 10, 16189.20, 2428.38, FALSE),
+    (2, CURRENT_DATE, 'Mumbai', 'Furniture', 'Corporate', 8, 2499, 5, 18992.40, 3038.78, FALSE),
+    (3, CURRENT_DATE, 'Delhi', 'Office Supplies', 'Small Business', 20, 499, 0, 9980.00, 1497.00, FALSE),
+    (4, CURRENT_DATE, 'Pune', 'Appliances', 'Consumer', 7, 3499, 15, 20819.05, 3331.05, TRUE),
+    (5, CURRENT_DATE, 'Hyderabad', 'Accessories', 'Corporate', 25, 899, 5, 21351.25, 3202.69, FALSE);
+```
+
+### 3. Add the database connection locally
+
+Copy the Supabase **Session pooler** URI. Create `.streamlit/secrets.toml`:
+
+```toml
+[connections.datasense_db]
+url = "postgresql+psycopg://USERNAME:PASSWORD@HOST:5432/postgres?sslmode=require"
+```
+
+Replace every placeholder with your own connection details.
+
+Do not commit this file. The repository's `.gitignore` excludes it.
+
+### 4. Test the connection
+
+```bash
+python -c 'import tomllib; from sqlalchemy import create_engine, text; config = tomllib.load(open(".streamlit/secrets.toml", "rb")); engine = create_engine(config["connections"]["datasense_db"]["url"]); connection = engine.connect(); print("Connected rows:", connection.execute(text("SELECT COUNT(*) FROM public.demo_sales")).scalar()); connection.close()'
+```
+
+Then start the app, select **Demo database**, and click **Refresh data**.
+
+## Security and privacy
+
+- No paid AI API key is required.
+- Ollama model inference runs locally.
+- Uploaded files are processed in application memory.
+- The optional Supabase dataset is cloud-hosted and fetched into the application.
+- Database credentials stay in `.streamlit/secrets.toml` and must never be committed.
+- The current demo connector executes a fixed read query.
+- Use a dedicated read-only PostgreSQL role before deploying the connector publicly.
+
+## Tests
+
+Run:
+
+```bash
+python -m pytest -q
+```
+
+Current automated checks cover core analytical behaviour, including data quality, cleaning, grounded insights, and follow-up memory.
+
+## Project status
+
+DataSense AI V2 is an active portfolio project. The database connector, quality workflow, analytical engine, visualisation workspace, and first predictive-modelling workflow are functional.
+
+Planned improvements:
+
+- Dataset blending and multi-table analysis
+- Time-series forecasting
+- Hypothesis testing
+- Anomaly detection
+- Additional read-only database connectors
+- Expanded automated test coverage
+
+## License
+
+See the repository's `LICENSE` file.
+
+---
+
+Built as a practical learning project in analytics, data science, and agentic AI.
+
+**Still learning. Still building.**
