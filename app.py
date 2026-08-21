@@ -82,7 +82,7 @@ try:
 except ImportError:
     SORTABLES_AVAILABLE = False
 
-APP_BUILD = "2026.08.21-AUTH-USAGE-PROFILE-ADMIN-AUTHUX-R14"
+APP_BUILD = "2026.08.21-AUTH-USAGE-PROFILE-ADMIN-AUTHUX-R15"
 print(f"### APP.PY LOADED - DATASENSE AI {APP_BUILD} ###")
 print(f"### SORTABLES_AVAILABLE = {SORTABLES_AVAILABLE} ###")
 
@@ -770,10 +770,10 @@ def render_auth_screen() -> None:
             elif mode == "signup":
                 st.markdown('<div class="ds-auth-label">CREATE ACCOUNT</div>', unsafe_allow_html=True)
                 with st.form("datasense_sign_up_form"):
-                    full_name = st.text_input("Full name", key="auth_sign_up_name", placeholder="Your name")
-                    email = st.text_input("Email", key="auth_sign_up_email", placeholder="you@example.com")
-                    password = st.text_input("Password", type="password", key="auth_sign_up_password")
-                    confirm_password = st.text_input("Confirm password", type="password", key="auth_sign_up_confirm_password")
+                    full_name = st.text_input("Full name", key="auth_sign_up_name", placeholder="Your name", autocomplete="name")
+                    email = st.text_input("Email", key="auth_sign_up_email", placeholder="you@example.com", autocomplete="email")
+                    password = st.text_input("Password", type="password", key="auth_sign_up_password", autocomplete="new-password")
+                    confirm_password = st.text_input("Confirm password", type="password", key="auth_sign_up_confirm_password", autocomplete="new-password")
                     submitted = st.form_submit_button("Create account", type="primary", use_container_width=True)
 
                 if submitted:
@@ -832,8 +832,8 @@ def render_auth_screen() -> None:
 
                 st.markdown('<div class="ds-auth-label">SIGN IN</div>', unsafe_allow_html=True)
                 with st.form("datasense_sign_in_form"):
-                    email = st.text_input("Email", key="auth_sign_in_email", placeholder="you@example.com")
-                    password = st.text_input("Password", type="password", key="auth_sign_in_password")
+                    email = st.text_input("Email", key="auth_sign_in_email", placeholder="you@example.com", autocomplete="username")
+                    password = st.text_input("Password", type="password", key="auth_sign_in_password", autocomplete="current-password")
                     submitted = st.form_submit_button("Sign in", type="primary", use_container_width=True)
 
                 if submitted:
