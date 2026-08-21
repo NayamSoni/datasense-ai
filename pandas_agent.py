@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 
-print("### PANDAS_AGENT.PY LOADED — VERSION 2026-08-11-v8 (Focused ranking output) ###")
+print("### PANDAS_AGENT.PY LOADED — VERSION 2026-08-19-v12 (mixed-type relationships) ###")
 
 from utils import detect_date_column
 
@@ -102,9 +102,10 @@ def apply_filters(df, filters):
         data = data[
             data[column]
             .astype(str)
-            .str.lower()
+            .str.strip()
+            .str.casefold()
             ==
-            str(value).lower()
+            str(value).strip().casefold()
         ]
 
     return data
@@ -191,6 +192,15 @@ def aggregate(df, operation, measure, group_by):
     if agg is None:
 
         raise ValueError(f"Unsupported operation: {operation}")
+
+    if (
+        agg not in ("count", "nunique")
+        and not pd.api.types.is_numeric_dtype(df[measure])
+    ):
+        raise ValueError(
+            f"'{operation}' requires a numeric measure, but '{measure}' is text. "
+            "Use count/nunique or select a numeric column."
+        )
 
     if len(group_by) == 0:
 
@@ -412,7 +422,14 @@ def top_bottom_analysis(
     # Otherwise the displayed subset would incorrectly add up to 100%.
     result = add_contribution(result, measure)
 
-    if limit:
+    if limit == 1 and not result.empty:
+
+        # A superlative can have more than one valid winner. Keep every tied
+        # entity instead of silently presenting the first row as unique.
+        winning_value = result.iloc[0][measure]
+        result = result[result[measure].eq(winning_value)]
+
+    elif limit:
 
         result = result.head(limit)
 
@@ -784,7 +801,10 @@ def correlation_analysis(data, measure, measure2):
 
     if len(clean) < 3:
 
-        return "Not enough numeric data to compute a correlation."
+        return (
+            "Correlation requires two numeric columns. If one field is a "
+            "category, compare the numeric distribution across its groups instead."
+        )
 
     corr = clean["Metric A Values"].corr(clean["Metric B Values"])
 
@@ -805,6 +825,81 @@ def correlation_analysis(data, measure, measure2):
         "Sample Size": [len(clean)]
 
     })
+
+
+# ======================================================
+# Numeric-to-categorical relationship analysis
+# ======================================================
+
+def _eta_squared_strength(value):
+    """Describe eta-squared using conventional descriptive thresholds."""
+    if value >= 0.14:
+        return "Large"
+    if value >= 0.06:
+        return "Moderate"
+    if value >= 0.01:
+        return "Small"
+    return "Negligible"
+
+
+def categorical_relationship_analysis(data, measure, category):
+    """Compare a numeric measure across groups and report eta-squared.
+
+    Pearson correlation is undefined for an unordered category. Eta-squared
+    measures the share of numeric variance associated with differences between
+    the category-group means, while the group table keeps the calculation
+    inspectable.
+    """
+    if category is None or category not in data.columns:
+        return "A categorical column is required for this relationship analysis."
+
+    clean = pd.DataFrame({
+        category: data[category],
+        measure: pd.to_numeric(data[measure], errors="coerce"),
+    }).dropna()
+
+    if len(clean) < 3 or clean[category].nunique() < 2:
+        return "Not enough valid groups to compare this numeric-to-category relationship."
+
+    grouped = (
+        clean.groupby(category, dropna=False)[measure]
+        .agg(Records="size", **{
+            f"Average {measure}": "mean",
+            f"Median {measure}": "median",
+            f"Std Dev {measure}": "std",
+        })
+        .reset_index()
+    )
+
+    overall_average = float(clean[measure].mean())
+    total_sum_squares = float(((clean[measure] - overall_average) ** 2).sum())
+    between_sum_squares = 0.0
+    average_column = f"Average {measure}"
+    for _, row in grouped.iterrows():
+        between_sum_squares += float(row["Records"]) * (
+            float(row[average_column]) - overall_average
+        ) ** 2
+    eta_squared = (
+        between_sum_squares / total_sum_squares
+        if total_sum_squares > 0 else 0.0
+    )
+
+    grouped["Difference from Overall %"] = (
+        (grouped[average_column] / overall_average - 1) * 100
+        if overall_average != 0 else 0.0
+    )
+    grouped["Association (η²)"] = round(eta_squared, 6)
+    grouped["Association Strength"] = _eta_squared_strength(eta_squared)
+    grouped = grouped.sort_values(average_column, ascending=False)
+
+    numeric_columns = [
+        average_column,
+        f"Median {measure}",
+        f"Std Dev {measure}",
+        "Difference from Overall %",
+    ]
+    grouped[numeric_columns] = grouped[numeric_columns].round(2)
+    return grouped.reset_index(drop=True)
 
 
 # ======================================================
@@ -853,7 +948,30 @@ def distribution_analysis(data, measure, bins=10):
 
         return f"No numeric data available in '{measure}' to build a distribution."
 
-    binned = pd.cut(series, bins=bins)
+    normalized_measure = str(measure).lower().replace("_", " ").strip()
+    is_age = "age" in normalized_measure.split()
+
+    if is_age:
+        # Human-friendly decade buckets are more useful for ages than the
+        # long floating-point ranges produced by generic equal-width bins.
+        lower = int(np.floor(series.min() / 10) * 10)
+        upper = int(np.ceil((series.max() + 1) / 10) * 10)
+        edges = np.arange(lower, upper + 1, 10)
+        if len(edges) < 2:
+            edges = np.array([lower, lower + 10])
+        labels = [
+            f"{int(left)}–{int(right - 1)}"
+            for left, right in zip(edges[:-1], edges[1:])
+        ]
+        binned = pd.cut(
+            series,
+            bins=edges,
+            labels=labels,
+            right=False,
+            include_lowest=True,
+        )
+    else:
+        binned = pd.cut(series, bins=bins, duplicates="drop")
 
     counts = binned.value_counts().sort_index()
 
@@ -949,6 +1067,111 @@ def pareto_analysis(
 # Main Calculation Engine
 # ======================================================
 
+def build_calculation_audit(df, plan):
+    """Describe the deterministic calculation path shown to the user."""
+    source_rows = len(df)
+    filters = plan.get("filters", [])
+    data = apply_filters(df, filters)
+    rows_after_filters = len(data)
+
+    data, time_group = apply_time_granularity(
+        data,
+        plan.get("time_granularity"),
+        year_filter=plan.get("year_filter"),
+        date_column=plan.get("date_column"),
+    )
+
+    analysis = plan.get("analysis_type", "aggregation")
+    measure = plan.get("measure")
+    operation_key = str(plan.get("operation", "sum")).lower()
+    count_basis = None
+
+    if analysis == "patient_count":
+        patient_column = plan.get("patient_column")
+        if patient_column in data.columns:
+            valid_measure_rows = int(data[patient_column].notna().sum())
+            formula = f"COUNT(DISTINCT {patient_column})"
+            count_basis = f"Distinct {patient_column}"
+        else:
+            valid_measure_rows = int(len(data))
+            formula = "COUNT(admission rows)"
+            count_basis = "Admission rows (no patient identifier found)"
+    elif analysis == "distribution":
+        valid_measure_rows = (
+            int(pd.to_numeric(data[measure], errors="coerce").notna().sum())
+            if measure in data.columns else 0
+        )
+        formula = f"COUNT(records) grouped into {measure} buckets"
+        count_basis = f"Rows with a non-null numeric {measure}"
+    elif analysis == "categorical_relationship":
+        category = next(
+            (column for column in plan.get("group_by", []) if column in data.columns),
+            None,
+        )
+        if category:
+            joint_valid = (
+                data[category].notna()
+                & pd.to_numeric(data[measure], errors="coerce").notna()
+            )
+            valid_measure_rows = int(joint_valid.sum())
+            formula = f"GROUP_MEAN_MEDIAN({measure}) + ETA_SQUARED BY {category}"
+            count_basis = f"Rows with non-null {category} and numeric {measure}"
+        else:
+            valid_measure_rows = 0
+            formula = f"CATEGORICAL_RELATIONSHIP({measure})"
+            count_basis = "No valid categorical field"
+    else:
+        if measure in data.columns:
+            if operation_key in ("count", "nunique"):
+                valid_measure_rows = int(data[measure].notna().sum())
+            else:
+                valid_measure_rows = int(
+                    pd.to_numeric(data[measure], errors="coerce").notna().sum()
+                )
+        else:
+            valid_measure_rows = 0
+
+        operation = operation_key.upper()
+        formula = f"{operation}({measure})"
+    group_by = [
+        column
+        for column in (time_group + plan.get("group_by", []))
+        if column in data.columns
+    ]
+    if analysis == "distribution" and measure in data.columns:
+        distribution_result = distribution_analysis(data, measure)
+        groups_evaluated = (
+            int(len(distribution_result))
+            if isinstance(distribution_result, pd.DataFrame)
+            else 0
+        )
+    else:
+        groups_evaluated = (
+            int(data[group_by].drop_duplicates().shape[0])
+            if group_by
+            else 1
+        )
+
+    if group_by and analysis != "categorical_relationship":
+        formula += f" grouped by {', '.join(map(str, group_by))}"
+
+    filter_text = " AND ".join(
+        f"{item.get('column')} = {item.get('value')}"
+        for item in filters
+    ) or "None"
+
+    return {
+        "source_rows": source_rows,
+        "rows_after_filters": rows_after_filters,
+        "valid_measure_rows": valid_measure_rows,
+        "groups_evaluated": groups_evaluated,
+        "formula": formula,
+        "count_basis": count_basis,
+        "filters": filter_text,
+        "sort": plan.get("sort") or "Not applied",
+        "limit": plan.get("limit"),
+    }
+
 def calculate(df, plan):
 
     if plan.get("no_data_message"):
@@ -979,7 +1202,7 @@ def calculate(df, plan):
 
     date_column = plan.get("date_column")
 
-    if measure not in data.columns:
+    if analysis != "patient_count" and measure not in data.columns:
 
         return f"Column '{measure}' not found."
 
@@ -1018,6 +1241,17 @@ def calculate(df, plan):
         ]
 
         group_by = time_group + group_by
+
+    if analysis == "patient_count":
+        patient_column = plan.get("patient_column")
+        if patient_column in data.columns:
+            value = data[patient_column].nunique(dropna=True)
+            label = plan.get("metric_label") or "Distinct Patients"
+        else:
+            value = len(data)
+            label = plan.get("metric_label") or "Patient Admission Records"
+
+        return pd.DataFrame({label: [int(value)]})
 
     if analysis == "average_order_value":
 
@@ -1114,6 +1348,20 @@ def calculate(df, plan):
             measure,
 
             plan.get("measure2")
+
+        )
+
+    if analysis == "categorical_relationship":
+
+        category = next((column for column in group_by if column in data.columns), None)
+
+        return categorical_relationship_analysis(
+
+            data,
+
+            measure,
+
+            category
 
         )
 

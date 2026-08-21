@@ -28,9 +28,35 @@ def _matches_any(text, keywords):
     return False
 
 
-def detect_intent(question):
+def detect_intent(question, knowledge_available=False):
 
     q = question.lower().strip()
+
+    # -------------------------
+    # Business Knowledge / RAG
+    # -------------------------
+
+    knowledge = [
+        "knowledge base",
+        "according to the document",
+        "according to our document",
+        "according to the policy",
+        "according to our policy",
+        "what is the definition",
+        "define",
+        "definition of",
+        "business rule",
+        "policy says",
+        "documentation says",
+        "how is this calculated",
+        "how do we calculate",
+        "formula for",
+    ]
+
+    means_question = bool(re.search(r"\bwhat does\b.+\bmean\b", q))
+
+    if means_question or _matches_any(q, knowledge):
+        return "KNOWLEDGE"
 
     # -------------------------
     # Explain Dataset
@@ -50,6 +76,23 @@ def detect_intent(question):
 
     if _matches_any(q, explain):
         return "EXPLAIN"
+
+    # When a knowledge index exists, a short "What is X?" question normally
+    # asks for business meaning. Keep explicit aggregations in the deterministic
+    # calculation path (for example, "What is total revenue by city?").
+    definition_style = bool(re.match(r"^what (?:is|are)\b", q))
+    calculation_cues = [
+        "total", "sum", "average", "avg", "mean", "median", "minimum",
+        "maximum", "min", "max", "count", "top", "bottom", "by", "vs",
+        "compare", "growth", "trend", "distribution", "correlation",
+        "outlier", "pareto", "monthly", "weekly", "daily", "yearly",
+    ]
+    if (
+        knowledge_available
+        and definition_style
+        and not _matches_any(q, calculation_cues)
+    ):
+        return "KNOWLEDGE"
 
     # -------------------------
     # Business Analyses

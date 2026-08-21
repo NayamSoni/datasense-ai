@@ -6,9 +6,17 @@ from pathlib import Path
 import streamlit as st
 import pandas as pd
 
+from auth import sign_in_user, sign_out_user, sign_up_user
+from usage_tracker import track_feature_open
+from account_portal import (
+    render_account_menu,
+    render_admin_dashboard,
+    render_profile_page,
+)
+
 from llm_agent import ask_llm
 from intent_agent import detect_intent
-from pandas_agent import statistical_summary, calculate
+from pandas_agent import build_calculation_audit, calculate, statistical_summary
 from query_planner import create_execution_plan, _dimension_mentioned_in_question, DIMENSION_KEYWORDS
 from visualization import render_chart, render_manual_chart, render_report_chart
 from theme import load_theme
@@ -41,7 +49,32 @@ from predictive_modeling import (
     render_data_science_lab,
     render_data_science_lab_intro,
 )
-from database_connector import load_demo_sales
+# Support both database connector versions. Older local projects only expose
+# ``load_demo_sales``; newer projects also provide the bundled-sample fallback.
+try:
+    from database_connector import load_demo_sales_with_fallback
+except ImportError:
+    from database_connector import load_demo_sales
+
+    def load_demo_sales_with_fallback():
+        return load_demo_sales(), {
+            "mode": "database",
+            "dataset_key": "supabase-demo-sales",
+            "label": "Supabase PostgreSQL",
+            "display_name": "Supabase · public.demo_sales",
+        }
+
+from rag_engine import (
+    DEFAULT_EMBEDDING_MODEL,
+    KnowledgeBaseError,
+    SUPPORTED_KNOWLEDGE_TYPES,
+    available_starter_industries,
+    build_knowledge_index,
+    configured_retrieval_backend,
+    format_retrieved_context,
+    retrieve_knowledge,
+    starter_glossary_document,
+)
 
 try:
     from streamlit_sortables import sort_items
@@ -49,7 +82,7 @@ try:
 except ImportError:
     SORTABLES_AVAILABLE = False
 
-APP_BUILD = "2026.08.11-DATABASE-OUTPUT-R2"
+APP_BUILD = "2026.08.21-AUTH-USAGE-PROFILE-ADMIN-AUTHUX-R14"
 print(f"### APP.PY LOADED - DATASENSE AI {APP_BUILD} ###")
 print(f"### SORTABLES_AVAILABLE = {SORTABLES_AVAILABLE} ###")
 
@@ -174,6 +207,671 @@ def activate_dataset(loaded_df: pd.DataFrame, dataset_id: str, source: str) -> N
 def compact_html(markup: str) -> str:
     """Keep Streamlit Markdown from breaking nested raw HTML at blank lines."""
     return "".join(line.strip() for line in markup.splitlines())
+
+
+# ==========================================================
+# AUTHENTICATION
+# ==========================================================
+
+def _remember_authenticated_user(user) -> None:
+    """Keep only the small identity fields DataSense needs in session state."""
+    metadata = getattr(user, "user_metadata", None) or {}
+    st.session_state.auth_user = {
+        "id": str(getattr(user, "id", "")),
+        "email": str(getattr(user, "email", "") or ""),
+        "full_name": str(metadata.get("full_name") or "").strip(),
+    }
+
+
+def _set_auth_mode(mode: str) -> None:
+    """Switch the unauthenticated experience between guided auth steps."""
+    allowed = {"welcome", "signup", "verify", "login"}
+    st.session_state.auth_mode = mode if mode in allowed else "welcome"
+
+
+def _friendly_auth_error(exc: Exception) -> str:
+    """Translate common Supabase auth failures into useful product guidance."""
+    message = str(exc or "").strip()
+    lowered = message.lower()
+
+    if "email not confirmed" in lowered or "email_not_confirmed" in lowered:
+        return (
+            "Your account exists, but your email is not confirmed yet. "
+            "Open the verification email from DataSense, confirm it, then sign in again."
+        )
+    if (
+        "invalid login credentials" in lowered
+        or "invalid_credentials" in lowered
+        or "invalid password" in lowered
+    ):
+        return (
+            "That email and password do not match. Check the credentials you used "
+            "when creating the account and try again."
+        )
+    if "user already registered" in lowered or "already registered" in lowered:
+        return (
+            "An account already exists for this email. Choose Log in and use the "
+            "password you created for that account."
+        )
+    if "rate limit" in lowered or "over_email_send_rate_limit" in lowered:
+        return (
+            "Supabase has temporarily limited authentication emails. Wait a little "
+            "before requesting another email, then try again."
+        )
+
+    return (
+        "DataSense could not complete that authentication step. Check your details "
+        "and try again. If you just created the account, make sure the verification "
+        "email has been confirmed first."
+    )
+
+
+def _render_auth_showcase() -> None:
+    """Render the branded DataSense D-to-product portal animation."""
+    st.markdown(
+        compact_html(
+            """
+            <div class="ds-auth-left">
+              <div class="ds-auth-left-label">DATASENSE AI · QUICK TOUR</div>
+              <div class="ds-tour-shell ds-portal-tour" aria-hidden="true">
+                <div class="ds-tour-topbar">
+                  <div class="ds-tour-dots"><i></i><i></i><i></i></div>
+                  <div class="ds-tour-title">DataSense AI</div>
+                </div>
+                <div class="ds-tour-progress"><span></span></div>
+
+                <div class="ds-brand-intro">
+                  <div class="ds-brand-glow"></div>
+                  <div class="ds-brand-stage">
+                    <div class="ds-brand-d">D</div>
+                    <div class="ds-brand-rest">
+                      <span>A</span><span>T</span><span>A</span><span>S</span><span>E</span><span>N</span><span>S</span><span>E</span>
+                    </div>
+                    <div class="ds-brand-tagline">Your AI data copilot</div>
+                  </div>
+                </div>
+
+                <div class="ds-portal-reveal">
+                  <div class="ds-portal-frame">
+                    <div class="ds-portal-door"><span>D</span></div>
+                  </div>
+                </div>
+
+                <div class="ds-product-demo">
+                  <div class="ds-product-sidebar">
+                    <div class="ds-product-brand">DS</div>
+                    <div class="ds-product-nav active">Workspace</div>
+                    <div class="ds-product-nav">Knowledge Base</div>
+                    <div class="ds-product-nav">Data Quality</div>
+                    <div class="ds-product-nav">Insights</div>
+                    <div class="ds-product-nav">Visualisation</div>
+                  </div>
+
+                  <div class="ds-product-main">
+                    <div class="ds-product-scene ds-scene-upload">
+                      <div class="ds-product-eyebrow">WORKSPACE</div>
+                      <div class="ds-product-heading">Bring your data into focus.</div>
+                      <div class="ds-product-upload">
+                        <div class="ds-product-upload-icon">⇪</div>
+                        <div><b>sales_q2.csv</b><small>Uploading to DataSense…</small></div>
+                        <div class="ds-product-upload-progress"><span></span></div>
+                      </div>
+                      <div class="ds-product-file-ready">Loaded · 19,324 rows</div>
+                    </div>
+
+                    <div class="ds-product-scene ds-scene-question">
+                      <div class="ds-product-eyebrow">ASK DATASENSE</div>
+                      <div class="ds-product-heading">Ask in plain English.</div>
+                      <div class="ds-product-question">Show sales by region</div>
+                      <div class="ds-product-answer">Building the analysis plan…</div>
+                    </div>
+
+                    <div class="ds-product-scene ds-scene-chart">
+                      <div class="ds-product-eyebrow">VISUALISATION</div>
+                      <div class="ds-product-heading">Sales by region</div>
+                      <div class="ds-product-chart">
+                        <div class="ds-product-bar" style="height:45%"><span>North</span></div>
+                        <div class="ds-product-bar" style="height:66%"><span>South</span></div>
+                        <div class="ds-product-bar" style="height:58%"><span>East</span></div>
+                        <div class="ds-product-bar highlight" style="height:88%"><span>West</span></div>
+                      </div>
+                      <div class="ds-product-caption">West leads overall sales performance.</div>
+                    </div>
+
+                    <div class="ds-product-scene ds-scene-insights">
+                      <div class="ds-product-eyebrow">INSIGHTS</div>
+                      <div class="ds-product-heading">Generate insights.</div>
+                      <div class="ds-product-generate">Generate insights</div>
+                      <div class="ds-product-insights">
+                        <div><b>Growth driver</b><small>West delivers the strongest revenue uplift.</small></div>
+                        <div><b>Risk signal</b><small>South margin is below the overall average.</small></div>
+                        <div><b>Recommended next step</b><small>Review regional mix and discounting.</small></div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="ds-tour-control">❚❚</div>
+              </div>
+            </div>
+            """
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def _render_auth_assistant(mode: str) -> None:
+    """Render a professional humanoid DataSense assistant on the auth side."""
+    messages = {
+        "welcome": "Hi, I’m DataSense AI. Ready to go inside?",
+        "signup": "Create your account and I’ll guide you through email confirmation next.",
+        "verify": "Check your inbox, confirm your email, then come back and sign in.",
+        "login": "Welcome back. Sign in and let’s explore your data.",
+    }
+    safe = html.escape(messages.get(mode, messages["welcome"]))
+    st.markdown(
+        compact_html(
+            f"""
+            <div class="ds-assistant-row">
+              <div class="ds-pro-robot" aria-hidden="true">
+                <div class="pro-aura"></div>
+                <div class="pro-head">
+                  <div class="pro-faceplate">
+                    <i class="pro-eye e1"></i><i class="pro-eye e2"></i>
+                    <i class="pro-mouth"></i>
+                  </div>
+                  <div class="pro-temple t1"></div><div class="pro-temple t2"></div>
+                </div>
+                <div class="pro-neck"></div>
+                <div class="pro-shoulders"><i></i><i></i></div>
+                <div class="pro-torso">
+                  <div class="pro-core"></div>
+                  <b>DS</b><small>AI</small>
+                </div>
+                <div class="pro-arm arm-left"></div><div class="pro-arm arm-right"></div>
+              </div>
+              <div class="ds-speech">{safe}</div>
+            </div>
+            """
+        ),
+        unsafe_allow_html=True,
+    )
+
+def render_auth_screen() -> None:
+    """Render the compact, above-the-fold DataSense authentication flow."""
+    if "auth_mode" not in st.session_state:
+        st.session_state.auth_mode = "welcome"
+
+    mode = str(st.session_state.get("auth_mode") or "welcome")
+    if mode not in {"welcome", "signup", "verify", "login"}:
+        mode = "welcome"
+        st.session_state.auth_mode = mode
+
+    if mode != "login":
+        st.session_state.pop("auth_sign_in_password", None)
+    if mode != "signup":
+        st.session_state.pop("auth_sign_up_password", None)
+        st.session_state.pop("auth_sign_up_confirm_password", None)
+
+    notice = st.session_state.pop("auth_notice", None)
+    if notice == "signed_out":
+        try:
+            st.toast("Signed out successfully.", icon="✅")
+        except Exception:
+            pass
+
+    st.markdown(
+        """
+        <style>
+        .block-container {
+            padding-top: .45rem !important;
+            padding-bottom: .45rem !important;
+            max-width: 1500px !important;
+        }
+        [data-testid="stHeader"] { background: transparent !important; }
+        .ds-auth-left { padding-top: .25rem; }
+        .ds-auth-left-label {
+            color:#91dcff; font-size:.72rem; font-weight:800; letter-spacing:.16em; margin:0 0 .55rem .15rem;
+        }
+        .ds-tour-shell {
+            position:relative; height:600px; overflow:hidden; border-radius:28px;
+            background:linear-gradient(150deg,rgba(5,10,28,.98),rgba(10,14,38,.96));
+            border:1px solid rgba(130,145,220,.16);
+            box-shadow:0 26px 60px rgba(0,0,0,.24), inset 0 1px 0 rgba(255,255,255,.03);
+        }
+        .ds-tour-topbar {
+            height:48px; display:flex; align-items:center; gap:8px; padding:0 16px;
+            background:linear-gradient(180deg,rgba(22,31,67,.98),rgba(12,18,44,.96));
+            border-bottom:1px solid rgba(126,143,210,.13);
+        }
+        .ds-tour-dots { display:flex; gap:6px; }
+        .ds-tour-dots i { display:block; width:9px; height:9px; border-radius:50%; background:#f87171; }
+        .ds-tour-dots i:nth-child(2){background:#fbbf24}.ds-tour-dots i:nth-child(3){background:#34d399}
+        .ds-tour-title { color:rgba(238,243,255,.9); font-size:.8rem; font-weight:700; margin-left:5px; }
+        .ds-tour-status { margin-left:auto; color:#d8dcff; background:rgba(111,97,255,.16); border:1px solid rgba(139,127,255,.2); border-radius:999px; padding:.28rem .58rem; font-size:.69rem; font-weight:750; }
+        .ds-tour-progress { height:3px; background:rgba(255,255,255,.05); }
+        .ds-tour-progress span { display:block; height:100%; width:100%; transform-origin:left center; background:linear-gradient(90deg,#39d5ef,#735fff); animation:tourProgress 18s linear infinite; }
+        .ds-tour-screen { position:absolute; left:0; right:0; top:51px; bottom:0; display:flex; opacity:0; pointer-events:none; }
+        .tour-1{animation:tourOne 10s infinite}.tour-2{animation:tourTwo 10s infinite}.tour-3{animation:tourThree 10s infinite}.tour-4{animation:tourFour 10s infinite}
+        .mock-sidebar { width:160px; padding:16px 12px; border-right:1px solid rgba(122,139,204,.12); background:rgba(7,14,34,.72); }
+        .mock-brand { width:38px; height:38px; display:flex; align-items:center; justify-content:center; border-radius:13px; background:linear-gradient(145deg,#6d5cff,#2e82d5); color:#fff; font-weight:850; margin-bottom:20px; }
+        .mock-nav { padding:9px 10px; margin-bottom:6px; border-radius:10px; color:rgba(206,216,242,.62); font-size:.75rem; }
+        .mock-nav.active { background:rgba(103,91,255,.16); color:#eef2ff; }
+        .mock-main { position:relative; flex:1; padding:30px 34px; overflow:hidden; background:radial-gradient(circle at 75% 10%,rgba(78,74,210,.11),transparent 30%); }
+        .mock-eyebrow { color:#8bdcff; font-size:.68rem; font-weight:800; letter-spacing:.14em; }
+        .mock-heading { color:#f7f9ff; font-size:1.7rem; font-weight:780; letter-spacing:-.035em; margin-top:.45rem; }
+        .mock-heading.small { font-size:1.45rem; }
+        .mock-sub { color:rgba(216,225,245,.64); font-size:.9rem; margin-top:.4rem; }
+        .mock-upload { margin-top:34px; max-width:560px; height:170px; border:1px dashed rgba(126,220,255,.34); border-radius:24px; display:flex; align-items:center; justify-content:center; gap:18px; background:rgba(15,29,67,.62); color:#eef7ff; }
+        .mock-upload-icon { width:58px; height:58px; display:flex; align-items:center; justify-content:center; border-radius:18px; background:rgba(35,68,127,.7); color:#9ef3ff; font-size:1.5rem; }
+        .mock-upload b,.mock-upload small{display:block}.mock-upload small{color:rgba(205,217,242,.6);margin-top:5px;font-size:.76rem}
+        .mock-file-row { display:flex; justify-content:space-between; align-items:center; padding:13px 15px; border-radius:15px; background:rgba(17,30,70,.72); border:1px solid rgba(128,145,214,.12); color:#f6f9ff; }
+        .mock-file-row span { color:#8fdfef; font-size:.75rem; }
+        .mock-kpis { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-top:16px; }
+        .mock-kpis>div { padding:15px; border-radius:16px; background:rgba(18,31,72,.72); border:1px solid rgba(128,145,214,.1); }
+        .mock-kpis small,.mock-kpis b{display:block}.mock-kpis small{color:rgba(204,216,241,.58);font-size:.72rem}.mock-kpis b{color:#fff;font-size:1.1rem;margin-top:7px}
+        .mock-chat-label { margin-top:24px; color:#9fdff5; font-size:.76rem; font-weight:700; }
+        .mock-question { margin-top:9px; padding:13px 15px; border-radius:15px; background:rgba(103,91,255,.14); color:#eef2ff; width:66%; font-size:.92rem; }
+        .mock-chart { display:flex; align-items:flex-end; gap:22px; height:285px; padding:28px 22px 24px; margin-top:18px; border-radius:22px; background:rgba(16,29,68,.66); border:1px solid rgba(126,145,216,.12); }
+        .mock-chart .bar { position:relative; flex:1; min-width:40px; max-width:90px; border-radius:15px 15px 6px 6px; background:linear-gradient(180deg,#7fe2ff,#4d70ec); box-shadow:0 9px 20px rgba(62,99,226,.18); }
+        .mock-chart .bar.emphasis { background:linear-gradient(180deg,#9cf3ff,#6557ff); }
+        .mock-chart .bar span { position:absolute; bottom:-24px; left:50%; transform:translateX(-50%); color:rgba(214,224,246,.65); font-size:.7rem; white-space:nowrap; }
+        .mock-caption { margin-top:26px; color:rgba(224,232,248,.72); font-size:.85rem; }
+        .mock-insight-actions { margin-top:18px; }
+        .mock-generate { display:inline-flex; padding:10px 15px; border-radius:12px; background:linear-gradient(90deg,#725dff,#5a43e9); color:#fff; font-size:.82rem; font-weight:700; box-shadow:0 9px 22px rgba(96,76,240,.24); }
+        .mock-insights { display:grid; gap:12px; margin-top:20px; max-width:640px; }
+        .mock-insights>div { padding:16px 17px; border-radius:17px; background:rgba(17,30,70,.72); border:1px solid rgba(128,145,214,.11); }
+        .mock-insights b,.mock-insights small{display:block}.mock-insights b{color:#f7f9ff;font-size:.9rem}.mock-insights small{color:rgba(205,217,242,.64);font-size:.77rem;margin-top:4px;line-height:1.45}
+        .ds-tour-control { position:absolute; right:16px; bottom:14px; width:38px; height:38px; border-radius:50%; display:flex; align-items:center; justify-content:center; background:rgba(230,235,246,.92); color:#0b1325; font-size:.72rem; font-weight:900; box-shadow:0 8px 18px rgba(0,0,0,.18); }
+
+        .ds-assistant-row {
+            display:flex; align-items:center; justify-content:center; gap:18px;
+            margin:18px auto 28px; max-width:420px;
+        }
+        .ds-pro-robot {
+            position:relative; width:132px; min-width:132px; height:182px;
+            filter:drop-shadow(0 18px 30px rgba(0,0,0,.28)); animation:miniFloat 5.2s ease-in-out infinite;
+        }
+        .pro-aura {
+            position:absolute; left:50%; top:28px; width:108px; height:108px; transform:translateX(-50%);
+            border-radius:50%; background:radial-gradient(circle,rgba(77,202,255,.16),rgba(111,97,255,.05) 55%,transparent 72%);
+            filter:blur(3px);
+        }
+        .pro-head {
+            position:absolute; left:50%; top:4px; width:84px; height:58px; transform:translateX(-50%);
+            border-radius:15px 15px 12px 12px;
+            background:linear-gradient(145deg,#dce8fb 0%,#91a9df 38%,#566abe 100%);
+            border:1.5px solid rgba(255,255,255,.40);
+            box-shadow:inset 0 -9px 16px rgba(22,37,92,.24), inset 0 5px 9px rgba(255,255,255,.18);
+        }
+        .pro-faceplate {
+            position:absolute; left:9px; right:9px; top:12px; height:34px; border-radius:10px;
+            background:linear-gradient(180deg,rgba(5,15,34,.98),rgba(10,27,58,.95));
+            border:1px solid rgba(115,220,255,.10);
+        }
+        .pro-eye { position:absolute; top:12px; width:9px; height:5px; border-radius:999px; background:#8feaff; box-shadow:0 0 10px rgba(120,228,255,.7); }
+        .pro-eye.e1 { left:17px; } .pro-eye.e2 { right:17px; }
+        .pro-mouth { position:absolute; left:50%; top:23px; width:22px; height:6px; transform:translateX(-50%); border-bottom:1.5px solid rgba(212,244,255,.78); border-radius:0 0 12px 12px; }
+        .pro-temple { position:absolute; top:20px; width:7px; height:18px; border-radius:4px; background:linear-gradient(#6b83d9,#3c51a4); }
+        .pro-temple.t1 { left:-5px; } .pro-temple.t2 { right:-5px; }
+        .pro-neck {
+            position:absolute; left:50%; top:58px; width:24px; height:18px; transform:translateX(-50%);
+            border-radius:4px; background:linear-gradient(#6076c8,#3d519b);
+        }
+        .pro-shoulders {
+            position:absolute; left:50%; top:72px; width:124px; height:36px; transform:translateX(-50%);
+            border-radius:30px 30px 12px 12px; background:linear-gradient(145deg,#647ce0,#2948a7);
+            border:1px solid rgba(190,211,255,.18);
+        }
+        .pro-shoulders i { position:absolute; top:11px; width:26px; height:9px; border-radius:999px; background:rgba(117,224,255,.22); }
+        .pro-shoulders i:first-child { left:13px; } .pro-shoulders i:last-child { right:13px; }
+        .pro-torso {
+            position:absolute; left:50%; top:83px; width:82px; height:88px; transform:translateX(-50%);
+            border-radius:12px 12px 22px 22px; background:linear-gradient(160deg,#4f67cb,#253f92 55%,#0d728a);
+            border:1.5px solid rgba(190,211,255,.20); display:flex; align-items:center; justify-content:center; gap:4px;
+            box-shadow:inset 0 -18px 26px rgba(4,18,71,.28);
+        }
+        .pro-core {
+            position:absolute; top:15px; left:50%; width:34px; height:5px; transform:translateX(-50%); border-radius:999px;
+            background:linear-gradient(90deg,#6d5cff,#8feaff); box-shadow:0 0 12px rgba(126,219,255,.45);
+        }
+        .pro-torso b { color:white; font-size:1.05rem; letter-spacing:.04em; transform:translateY(9px); }
+        .pro-torso small { color:#a9f5ff; font-size:.55rem; font-weight:800; transform:translateY(13px); }
+        .pro-arm {
+            position:absolute; top:88px; width:18px; height:73px; border-radius:11px 11px 14px 14px;
+            background:linear-gradient(180deg,#4c64bd,#1f3375); border:1px solid rgba(190,211,255,.12);
+        }
+        .arm-left { left:4px; transform:rotate(4deg); } .arm-right { right:4px; transform:rotate(-4deg); }
+        .ds-speech {
+            position:relative; flex:1; padding:14px 16px; border-radius:18px 18px 18px 9px;
+            background:rgba(12,21,51,.78); border:1px solid rgba(130,146,217,.14);
+            color:rgba(238,243,255,.9); line-height:1.48; font-size:.9rem;
+        }
+        .ds-speech:before { content:""; position:absolute; left:-8px; bottom:18px; width:16px; height:16px; background:rgba(12,21,51,.78); transform:rotate(45deg); border-left:1px solid rgba(130,146,217,.12); border-bottom:1px solid rgba(130,146,217,.12); }
+
+        .ds-auth-label { color:#8bdcff; font-size:.7rem; font-weight:800; letter-spacing:.14em; margin-bottom:.65rem; }
+        .ds-auth-verify-banner { margin:.35rem 0 .75rem; padding:.85rem .9rem .9rem 1rem; border-left:3px solid #6f61ff; border-radius:0 13px 13px 0; background:rgba(111,97,255,.08); color:rgba(228,235,250,.82); line-height:1.5; font-size:.88rem; }
+        .ds-auth-steps-inline { display:flex; gap:.45rem; flex-wrap:wrap; margin:.6rem 0 .8rem; }
+        .ds-auth-steps-inline span { padding:.38rem .55rem; border-radius:999px; background:rgba(11,20,49,.72); border:1px solid rgba(131,148,221,.14); color:rgba(223,231,248,.78); font-size:.7rem; font-weight:620; }
+        .ds-auth-note { margin-top:.6rem; color:rgba(203,212,234,.58); font-size:.8rem; line-height:1.45; }
+        .stButton>button[kind="primary"] { min-height:3rem !important; font-weight:700 !important; }
+        .stButton>button { min-height:2.9rem !important; }
+        .stTextInput>div>div>input { min-height:2.55rem !important; }
+        div[data-testid="stForm"] { border:0 !important; padding:0 !important; }
+
+        @keyframes tourProgress { from{transform:scaleX(0)}to{transform:scaleX(1)} }
+        @keyframes tourOne { 0%,23%{opacity:1}25%,100%{opacity:0} }
+        @keyframes tourTwo { 0%,24%{opacity:0}26%,48%{opacity:1}50%,100%{opacity:0} }
+        @keyframes tourThree { 0%,49%{opacity:0}51%,73%{opacity:1}75%,100%{opacity:0} }
+        @keyframes tourFour { 0%,74%{opacity:0}76%,98%{opacity:1}100%{opacity:0} }
+        @keyframes miniFloat { 0%,100%{transform:translateY(0)}50%{transform:translateY(-7px)} }
+
+        @media (max-height: 820px) and (min-width: 901px) {
+          .ds-tour-shell { height:540px; }
+          .ds-assistant-row { margin:8px 0 16px; }
+          .ds-pro-robot { transform:scale(.92); transform-origin:center; }
+        }
+        @media (max-width: 1100px) {
+          .ds-tour-shell { height:540px; }
+          .mock-sidebar { width:135px; }
+          .mock-main { padding:24px 26px; }
+        }
+        @media (max-width: 900px) {
+          .ds-tour-shell { height:500px; }
+          .mock-sidebar { width:118px; }
+          .ds-assistant-row { margin-top:8px; }
+        }
+        
+        /* ---------- R12 DataSense D-to-product portal ---------- */
+        .ds-portal-tour { height: 570px; }
+        .ds-brand-intro, .ds-portal-reveal, .ds-product-demo {
+            position:absolute; left:0; right:0; top:52px; bottom:0;
+        }
+        .ds-brand-intro {
+            z-index:8; display:flex; align-items:center; justify-content:center;
+            background:
+                radial-gradient(circle at 50% 45%, rgba(75,145,255,.15), transparent 26%),
+                radial-gradient(circle at 50% 50%, rgba(124,92,255,.13), transparent 38%);
+            animation:dsBrandIntro 18s infinite;
+        }
+        .ds-brand-glow {
+            position:absolute; width:330px; height:330px; border-radius:50%;
+            background:radial-gradient(circle, rgba(57,215,239,.16), rgba(124,92,255,.12) 38%, transparent 70%);
+            filter:blur(12px); animation:dsBrandGlow 2.2s ease-in-out infinite;
+        }
+        .ds-brand-stage { position:relative; z-index:2; display:flex; align-items:center; justify-content:center; min-width:540px; height:190px; }
+        .ds-brand-d {
+            position:relative; z-index:3; color:#f8fbff; font-family:"Space Grotesk","Inter",sans-serif;
+            font-size:150px; font-weight:800; line-height:1; letter-spacing:-.09em;
+            text-shadow:0 0 25px rgba(101,195,255,.35), 0 0 70px rgba(96,70,230,.24);
+            animation:dsLetterD 18s infinite;
+        }
+        .ds-brand-rest { display:flex; align-items:center; margin-left:8px; overflow:hidden; }
+        .ds-brand-rest span {
+            display:inline-block; color:#edf5ff; font-family:"Space Grotesk","Inter",sans-serif;
+            font-size:72px; font-weight:760; letter-spacing:-.05em; opacity:0; transform:translateX(-30px) scale(.92);
+            animation:dsLetterRest 18s infinite;
+        }
+        .ds-brand-rest span:nth-child(1){animation-delay:.05s}.ds-brand-rest span:nth-child(2){animation-delay:.10s}
+        .ds-brand-rest span:nth-child(3){animation-delay:.15s}.ds-brand-rest span:nth-child(4){animation-delay:.20s}
+        .ds-brand-rest span:nth-child(5){animation-delay:.25s}.ds-brand-rest span:nth-child(6){animation-delay:.30s}
+        .ds-brand-rest span:nth-child(7){animation-delay:.35s}.ds-brand-rest span:nth-child(8){animation-delay:.40s}
+        .ds-brand-tagline {
+            position:absolute; top:150px; left:50%; transform:translateX(-50%); white-space:nowrap;
+            color:rgba(195,223,245,.68); font-size:.78rem; font-weight:700; letter-spacing:.15em; text-transform:uppercase;
+            opacity:0; animation:dsTagline 18s infinite;
+        }
+        .ds-portal-reveal {
+            z-index:9; display:flex; align-items:center; justify-content:center; pointer-events:none;
+            opacity:0; animation:dsPortalLayer 18s infinite;
+        }
+        .ds-portal-frame { position:relative; width:210px; height:300px; perspective:900px; }
+        .ds-portal-door {
+            position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+            border-radius:40px 40px 34px 34px; transform-origin:left center;
+            background:linear-gradient(150deg, rgba(75,127,255,.96), rgba(91,63,222,.95) 58%, rgba(20,162,198,.90));
+            border:1px solid rgba(204,226,255,.55); box-shadow:0 0 42px rgba(74,112,255,.30), inset 0 1px 0 rgba(255,255,255,.22);
+            animation:dsDoorOpen 18s infinite;
+        }
+        .ds-portal-door span { color:white; font-family:"Space Grotesk","Inter",sans-serif; font-size:126px; font-weight:820; letter-spacing:-.10em; transform:translateX(-5px); }
+        .ds-product-demo {
+            z-index:5; display:flex; opacity:0; transform:scale(.92); transform-origin:center;
+            background:linear-gradient(145deg, rgba(5,10,29,.98), rgba(8,14,36,.98));
+            animation:dsProductReveal 18s infinite;
+        }
+        .ds-product-sidebar {
+            width:155px; flex:0 0 155px; padding:22px 14px; background:rgba(6,12,30,.94); border-right:1px solid rgba(133,149,210,.11);
+        }
+        .ds-product-brand {
+            display:grid; place-items:center; width:42px; height:42px; margin:0 auto 24px; border-radius:14px;
+            color:#fff; font-weight:800; background:linear-gradient(145deg,#7c5cff,#2478c8); box-shadow:0 10px 22px rgba(78,66,220,.22);
+        }
+        .ds-product-nav { padding:9px 10px; margin:5px 0; border-radius:9px; color:rgba(181,194,222,.64); font-size:.69rem; font-weight:650; }
+        .ds-product-nav.active { color:#fff; background:rgba(124,92,255,.15); border:1px solid rgba(124,92,255,.20); }
+        .ds-product-main { position:relative; flex:1; overflow:hidden; padding:28px 34px; }
+        .ds-product-scene { position:absolute; inset:28px 34px; opacity:0; transform:translateY(8px); }
+        .ds-scene-upload { animation:dsUploadScene 18s infinite; }
+        .ds-scene-question { animation:dsQuestionScene 18s infinite; }
+        .ds-scene-chart { animation:dsChartScene 18s infinite; }
+        .ds-scene-insights { animation:dsInsightsScene 18s infinite; }
+        .ds-product-eyebrow { color:#91dcff; font-size:.68rem; font-weight:800; letter-spacing:.16em; }
+        .ds-product-heading { margin-top:.6rem; color:#f5f8ff; font-size:1.45rem; font-weight:760; letter-spacing:-.025em; }
+        .ds-product-upload {
+            position:relative; display:flex; align-items:center; gap:14px; margin-top:1.25rem; padding:18px; border-radius:18px;
+            background:rgba(15,27,64,.78); border:1px dashed rgba(139,220,255,.32); max-width:520px;
+        }
+        .ds-product-upload-icon { display:grid; place-items:center; width:52px; height:52px; border-radius:16px; color:#a6f5ff; background:rgba(34,75,145,.45); font-size:1.35rem; }
+        .ds-product-upload b { display:block; color:#fff; }.ds-product-upload small { display:block; margin-top:3px; color:rgba(199,212,238,.63); }
+        .ds-product-upload-progress { position:absolute; left:18px; right:18px; bottom:8px; height:3px; overflow:hidden; background:rgba(255,255,255,.06); border-radius:99px; }
+        .ds-product-upload-progress span { display:block; width:100%; height:100%; background:linear-gradient(90deg,#22d3ee,#7c5cff); animation:dsUploadProgress 18s infinite; transform-origin:left; }
+        .ds-product-file-ready { margin-top:.85rem; color:#9ae6c8; font-size:.78rem; font-weight:650; }
+        .ds-product-question { margin-top:1.2rem; width:fit-content; max-width:78%; padding:12px 15px; border-radius:16px 16px 16px 6px; background:rgba(105,88,255,.16); color:#fff; font-weight:650; }
+        .ds-product-answer { margin:12px 0 0 auto; width:fit-content; padding:11px 14px; border-radius:16px 16px 6px 16px; background:rgba(17,31,72,.86); color:rgba(218,228,248,.77); font-size:.82rem; }
+        .ds-product-chart { display:flex; align-items:flex-end; gap:14px; height:215px; margin-top:1rem; padding:10px 12px 30px; border-radius:18px; background:rgba(14,25,59,.58); }
+        .ds-product-bar { position:relative; flex:1; border-radius:14px 14px 5px 5px; background:linear-gradient(180deg,rgba(95,159,255,.78),rgba(73,87,209,.78)); box-shadow:0 10px 20px rgba(45,74,190,.15); }
+        .ds-product-bar.highlight { background:linear-gradient(180deg,#71e1f5,#6e61ff); box-shadow:0 12px 28px rgba(75,145,255,.25); }
+        .ds-product-bar span { position:absolute; left:50%; bottom:-23px; transform:translateX(-50%); color:rgba(201,212,236,.63); font-size:.68rem; }
+        .ds-product-caption { margin-top:.65rem; color:rgba(214,224,244,.72); font-size:.82rem; }
+        .ds-product-generate { margin-top:1rem; display:inline-flex; padding:9px 14px; border-radius:11px; background:linear-gradient(110deg,#7c5cff,#5b3fde); color:#fff; font-size:.78rem; font-weight:720; box-shadow:0 10px 24px rgba(91,63,222,.22); }
+        .ds-product-insights { display:grid; gap:8px; margin-top:.85rem; max-width:560px; }
+        .ds-product-insights > div { padding:10px 12px; border-radius:13px; background:rgba(17,30,70,.72); border:1px solid rgba(127,146,219,.10); }
+        .ds-product-insights b { display:block; color:#f6f8ff; font-size:.78rem; }.ds-product-insights small { display:block; margin-top:2px; color:rgba(199,211,236,.62); font-size:.69rem; }
+
+        /* R14: fast branded flash, then move immediately into the product tour. */
+        @keyframes dsBrandIntro {
+            0%, 7% { opacity:1; visibility:visible; }
+            9%, 100% { opacity:0; visibility:hidden; }
+        }
+        @keyframes dsBrandGlow {
+            0%,100% { transform:scale(.92); opacity:.52; }
+            50% { transform:scale(1.07); opacity:.86; }
+        }
+        @keyframes dsLetterD {
+            0% { opacity:0; transform:scale(.62) rotateY(-24deg); filter:blur(3px); }
+            1.5%, 5.5% { opacity:1; transform:scale(1) rotateY(0); filter:blur(0); }
+            7.5%,100% { opacity:0; transform:scale(1.08); }
+        }
+        @keyframes dsLetterRest {
+            0%, 2% { opacity:0; transform:translateX(-28px) scale(.92); filter:blur(3px); }
+            4%, 6.5% { opacity:1; transform:translateX(0) scale(1); filter:blur(0); }
+            8.5%,100% { opacity:0; transform:translateX(10px); }
+        }
+        @keyframes dsTagline {
+            0%, 4.5% { opacity:0; transform:translate(-50%,7px); }
+            5.5%, 7.5% { opacity:1; transform:translate(-50%,0); }
+            9%,100% { opacity:0; }
+        }
+        @keyframes dsPortalLayer {
+            0%, 6% { opacity:0; }
+            7%, 12% { opacity:1; }
+            14%,100% { opacity:0; }
+        }
+        @keyframes dsDoorOpen {
+            0%, 6.5% { transform:rotateY(0) scale(.72); opacity:1; }
+            7.5% { transform:rotateY(0) scale(1); opacity:1; }
+            10.5% { transform:rotateY(-76deg) scale(2.05); opacity:1; }
+            13%,100% { transform:rotateY(-94deg) scale(2.65); opacity:0; }
+        }
+        @keyframes dsProductReveal {
+            0%, 10% { opacity:0; transform:scale(.88); filter:blur(3px); }
+            13%, 98% { opacity:1; transform:scale(1); filter:blur(0); }
+            100% { opacity:0; transform:scale(.98); }
+        }
+        @keyframes dsUploadScene {
+            0%, 12% { opacity:0; }
+            14%, 31% { opacity:1; transform:translateY(0); }
+            33%,100% { opacity:0; }
+        }
+        @keyframes dsQuestionScene {
+            0%, 31% { opacity:0; }
+            34%, 50% { opacity:1; transform:translateY(0); }
+            53%,100% { opacity:0; }
+        }
+        @keyframes dsChartScene {
+            0%, 51% { opacity:0; }
+            54%, 70% { opacity:1; transform:translateY(0); }
+            73%,100% { opacity:0; }
+        }
+        @keyframes dsInsightsScene {
+            0%, 71% { opacity:0; }
+            74%, 98% { opacity:1; transform:translateY(0); }
+            100% { opacity:0; }
+        }
+        @keyframes dsUploadProgress {
+            0%, 14% { transform:scaleX(0); }
+            28%,100% { transform:scaleX(1); }
+        }
+        @media (max-height:820px) and (min-width:901px){ .ds-portal-tour{height:520px}.ds-brand-d{font-size:126px}.ds-brand-rest span{font-size:62px}.ds-product-chart{height:175px} }
+        @media (max-width:1100px){ .ds-portal-tour{height:520px}.ds-brand-stage{min-width:450px}.ds-brand-d{font-size:120px}.ds-brand-rest span{font-size:56px}.ds-product-sidebar{width:130px;flex-basis:130px}.ds-product-main{padding:22px 24px}.ds-product-scene{inset:22px 24px} }
+</style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    left_col, right_col = st.columns([1.18, 0.82], gap="large")
+
+    with left_col:
+        _render_auth_showcase()
+
+    with right_col:
+        _, auth_center, _ = st.columns([0.14, 0.72, 0.14])
+        with auth_center:
+            _render_auth_assistant(mode)
+
+            if mode == "welcome":
+                if st.button("Create my account", type="primary", use_container_width=True, icon=":material/person_add:", key="auth_welcome_signup"):
+                    _set_auth_mode("signup")
+                    st.rerun()
+                if st.button("I already have an account", use_container_width=True, icon=":material/login:", key="auth_welcome_login"):
+                    _set_auth_mode("login")
+                    st.rerun()
+                st.markdown('<div class="ds-auth-note" style="text-align:center;">Forgot password?</div>', unsafe_allow_html=True)
+
+            elif mode == "signup":
+                st.markdown('<div class="ds-auth-label">CREATE ACCOUNT</div>', unsafe_allow_html=True)
+                with st.form("datasense_sign_up_form"):
+                    full_name = st.text_input("Full name", key="auth_sign_up_name", placeholder="Your name")
+                    email = st.text_input("Email", key="auth_sign_up_email", placeholder="you@example.com")
+                    password = st.text_input("Password", type="password", key="auth_sign_up_password")
+                    confirm_password = st.text_input("Confirm password", type="password", key="auth_sign_up_confirm_password")
+                    submitted = st.form_submit_button("Create account", type="primary", use_container_width=True)
+
+                if submitted:
+                    full_name = full_name.strip()
+                    email = email.strip()
+                    if not full_name or not email or not password:
+                        st.warning("Enter your name, email, and password.")
+                    elif password != confirm_password:
+                        st.warning("The passwords do not match.")
+                    elif len(password) < 6:
+                        st.warning("Use a password with at least 6 characters.")
+                    else:
+                        try:
+                            response = sign_up_user(full_name, email, password)
+                            user = getattr(response, "user", None)
+                            session = getattr(response, "session", None)
+                            if user is not None and session is not None:
+                                _remember_authenticated_user(user)
+                                st.session_state.auth_notice = "account_created"
+                                st.rerun()
+                            if user is not None:
+                                st.session_state.auth_pending_email = email
+                                st.session_state.auth_sign_in_email = email
+                                _set_auth_mode("verify")
+                                st.rerun()
+                            st.error("DataSense could not create the account. Check the details and try again.")
+                        except Exception as exc:
+                            st.error(_friendly_auth_error(exc))
+
+                if st.button("Sign in instead", use_container_width=True, key="auth_signup_login"):
+                    _set_auth_mode("login")
+                    st.rerun()
+                if st.button("Back", use_container_width=True, key="auth_signup_back"):
+                    _set_auth_mode("welcome")
+                    st.rerun()
+
+            elif mode == "verify":
+                pending_email = str(st.session_state.get("auth_pending_email") or st.session_state.get("auth_sign_in_email") or "your email").strip()
+                safe_email = html.escape(pending_email)
+                st.markdown('<div class="ds-auth-label">CHECK YOUR EMAIL</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="ds-auth-verify-banner">We sent a verification link to <strong>{safe_email}</strong>.<br><br>Open the newest DataSense or Supabase email, confirm your account, then come back here.</div>', unsafe_allow_html=True)
+                st.markdown('<div class="ds-auth-steps-inline"><span>1. Open email</span><span>2. Confirm</span><span>3. Return</span></div>', unsafe_allow_html=True)
+                if st.button("I’ve confirmed my email", type="primary", use_container_width=True, icon=":material/mark_email_read:", key="auth_verify_continue"):
+                    _set_auth_mode("login")
+                    st.rerun()
+                if st.button("Back to start", use_container_width=True, key="auth_verify_different"):
+                    for key in ("auth_pending_email", "auth_sign_in_email", "auth_sign_up_email", "auth_sign_up_name", "auth_sign_up_password", "auth_sign_up_confirm_password"):
+                        st.session_state.pop(key, None)
+                    _set_auth_mode("welcome")
+                    st.rerun()
+
+            else:
+                pending_email = str(st.session_state.get("auth_pending_email") or st.session_state.get("auth_sign_in_email") or "").strip()
+                if pending_email and "auth_sign_in_email" not in st.session_state:
+                    st.session_state.auth_sign_in_email = pending_email
+
+                st.markdown('<div class="ds-auth-label">SIGN IN</div>', unsafe_allow_html=True)
+                with st.form("datasense_sign_in_form"):
+                    email = st.text_input("Email", key="auth_sign_in_email", placeholder="you@example.com")
+                    password = st.text_input("Password", type="password", key="auth_sign_in_password")
+                    submitted = st.form_submit_button("Sign in", type="primary", use_container_width=True)
+
+                if submitted:
+                    email = email.strip()
+                    if not email or not password:
+                        st.warning("Enter both your email and password.")
+                    else:
+                        try:
+                            response = sign_in_user(email, password)
+                            user = getattr(response, "user", None)
+                            if user is None:
+                                st.error("DataSense could not sign you in. Check your email and password.")
+                            else:
+                                _remember_authenticated_user(user)
+                                st.session_state.pop("auth_pending_email", None)
+                                st.rerun()
+                        except Exception as exc:
+                            st.error(_friendly_auth_error(exc))
+
+                st.markdown('<div class="ds-auth-note">Forgot password?</div>', unsafe_allow_html=True)
+                if st.button("Create account", use_container_width=True, key="auth_login_create"):
+                    _set_auth_mode("signup")
+                    st.rerun()
+                if st.button("Back", use_container_width=True, key="auth_login_back"):
+                    _set_auth_mode("welcome")
+                    st.rerun()
+
+def handle_sign_out() -> None:
+    """Sign out, clear private state, then return to the welcome experience."""
+    try:
+        sign_out_user()
+    finally:
+        st.session_state.clear()
+        st.session_state.auth_notice = "signed_out"
+        st.session_state.auth_mode = "welcome"
+    st.rerun()
+
+
 
 
 # ==========================================================
@@ -322,6 +1020,24 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# Require authentication before rendering the DataSense workspace.
+if "auth_user" not in st.session_state:
+    st.session_state.auth_user = None
+
+if not st.session_state.auth_user:
+    render_auth_screen()
+    st.stop()
+
+# Auth password fields are no longer rendered once the user is signed in. Clear
+# any remaining widget values before the workspace starts.
+for _auth_secret_key in (
+    "auth_sign_in_password",
+    "auth_sign_up_password",
+    "auth_sign_up_confirm_password",
+):
+    st.session_state.pop(_auth_secret_key, None)
+
+
 # ==========================================================
 # SIDEBAR BRANDING
 # ==========================================================
@@ -384,13 +1100,26 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
+    # Keep account controls compact: the email and sign-out button are no
+    # longer permanently visible. They live inside the collapsed account menu
+    # rendered at the bottom of the sidebar.
+    auth_user = st.session_state.get("auth_user") or {}
+
     if st.session_state.get("nav_active") == "Future Roadmap":
         st.session_state.nav_active = "Data Science Lab"
     elif "nav_active" not in st.session_state or st.session_state.nav_active in ("Home", "Chat"):
         st.session_state.nav_active = "Workspace"
 
+    # Record one authenticated feature-open event when the user enters a
+    # different DataSense section. Normal Streamlit reruns are de-duplicated.
+    track_feature_open(
+        feature=st.session_state.nav_active,
+        auth_user=st.session_state.get("auth_user") or {},
+    )
+
     nav_items = [
         ("Workspace", ":material/home:", None),
+        ("Knowledge Base", ":material/library_books:", None),
         ("Data Quality", ":material/verified:", None),
         ("Insights", ":material/lightbulb:", None),
         ("Learned Rules", ":material/psychology:", None),
@@ -438,10 +1167,11 @@ with st.sidebar:
     else:
         st.caption("No conversations yet")
 
+    active_source = st.session_state.get("active_dataset_source")
     source_status = (
-        "Supabase source · Local AI"
-        if st.session_state.get("dataset_source_mode") == "Demo database"
-        else "File source · Local AI"
+        f"{active_source} · Local AI"
+        if active_source
+        else "No dataset selected · Local AI"
     )
 
     st.markdown(
@@ -456,6 +1186,26 @@ with st.sidebar:
         """,
         unsafe_allow_html=True,
     )
+
+    # Compact account control at the bottom of the sidebar. Profile is available
+    # to every signed-in user; Admin Dashboard appears only for allow-listed admins.
+    render_account_menu(
+        auth_user,
+        on_sign_out=handle_sign_out,
+    )
+
+
+# ==========================================================
+# ACCOUNT ROUTER - Profile / Admin Dashboard
+# ==========================================================
+
+if st.session_state.nav_active == "Profile":
+    render_profile_page(st.session_state.get("auth_user") or {})
+    st.stop()
+
+if st.session_state.nav_active == "Admin Dashboard":
+    render_admin_dashboard(st.session_state.get("auth_user") or {})
+    st.stop()
 
 
 # ==========================================================
@@ -525,6 +1275,199 @@ if "messages" not in st.session_state:
 
 
 # ==========================================================
+# KNOWLEDGE BASE - RAG
+# ==========================================================
+
+if st.session_state.nav_active == "Knowledge Base":
+    retrieval_backend = configured_retrieval_backend()
+
+    st.markdown("## Business Knowledge Base")
+    st.caption(
+        "Start with built-in KPI knowledge for an industry, or upload company-"
+        "specific documentation. DataSense retrieves relevant passages before "
+        "answering and keeps the retrieval index only for this session."
+    )
+    if retrieval_backend == "tfidf":
+        st.caption("Retrieval mode: TF-IDF · Cloud-compatible text retrieval")
+    else:
+        st.caption(
+            "Retrieval mode: Semantic embeddings · "
+            f"Local Ollama model: {DEFAULT_EMBEDDING_MODEL}"
+        )
+
+    st.markdown("### Use built-in industry knowledge")
+    try:
+        starter_industries = available_starter_industries()
+    except KnowledgeBaseError as exc:
+        starter_industries = []
+        st.error(str(exc))
+
+    starter_industry = st.selectbox(
+        "Industry",
+        options=starter_industries,
+        key="starter_knowledge_industry",
+        help="Each starter pack contains five common KPI definitions and formulas.",
+    ) if starter_industries else None
+
+    st.markdown("### Or upload your own knowledge")
+    knowledge_files = st.file_uploader(
+        "Upload knowledge files",
+        type=list(SUPPORTED_KNOWLEDGE_TYPES),
+        accept_multiple_files=True,
+        key="knowledge_uploader",
+        help="Supported formats: PDF, TXT, Markdown, and CSV.",
+    )
+
+    with st.expander("Retrieval settings"):
+        if retrieval_backend == "ollama":
+            embedding_model = st.text_input(
+                "Local Ollama embedding model",
+                value=st.session_state.get(
+                    "knowledge_embedding_model",
+                    DEFAULT_EMBEDDING_MODEL,
+                ),
+                key="knowledge_embedding_model_input",
+                help=(
+                    "The default is embeddinggemma. Install it once with "
+                    "`ollama pull embeddinggemma`."
+                ),
+            ).strip()
+        else:
+            embedding_model = DEFAULT_EMBEDDING_MODEL
+            st.caption(
+                "TF-IDF uses scikit-learn and does not require a separate "
+                "embedding model or embedding API key."
+            )
+
+    starter_col, custom_col, clear_col = st.columns([2, 2, 1])
+    with starter_col:
+        starter_clicked = st.button(
+            "Load starter knowledge",
+            type="primary",
+            use_container_width=True,
+            disabled=starter_industry is None,
+            icon=":material/database:",
+        )
+    with custom_col:
+        custom_clicked = st.button(
+            "Index uploaded files",
+            use_container_width=True,
+            disabled=not knowledge_files,
+            icon=":material/upload_file:",
+        )
+    with clear_col:
+        clear_clicked = st.button(
+            "Clear",
+            use_container_width=True,
+            disabled="knowledge_index" not in st.session_state,
+            icon=":material/delete:",
+        )
+
+    if clear_clicked:
+        st.session_state.pop("knowledge_index", None)
+        st.session_state.pop("knowledge_embedding_model", None)
+        st.rerun()
+
+    if starter_clicked or custom_clicked:
+        if retrieval_backend == "ollama" and not embedding_model:
+            st.error("Enter an Ollama embedding model name.")
+        else:
+            try:
+                if starter_clicked:
+                    documents = [starter_glossary_document(starter_industry)]
+                    selected_starter = starter_industry
+                else:
+                    documents = [
+                        (item.name, item.getvalue())
+                        for item in knowledge_files
+                    ]
+                    selected_starter = None
+
+                spinner_text = (
+                    "Reading documents and creating semantic embeddings..."
+                    if retrieval_backend == "ollama"
+                    else "Reading documents and creating the TF-IDF index..."
+                )
+                with st.spinner(spinner_text):
+                    index = build_knowledge_index(
+                        documents,
+                        model=embedding_model,
+                        retrieval_backend=retrieval_backend,
+                    )
+                index["starter_industry"] = selected_starter
+                st.session_state.knowledge_index = index
+                if retrieval_backend == "ollama":
+                    st.session_state.knowledge_embedding_model = embedding_model
+                else:
+                    st.session_state.pop("knowledge_embedding_model", None)
+                st.success(
+                    f"Knowledge ready · {len(index['documents'])} file(s) · "
+                    f"{len(index['chunks'])} searchable chunks"
+                )
+            except KnowledgeBaseError as exc:
+                st.error(str(exc))
+            except Exception as exc:
+                st.error(f"Could not build the knowledge index. Details: {exc}")
+
+    knowledge_index = st.session_state.get("knowledge_index")
+    if knowledge_index:
+        st.markdown("### Indexed sources")
+        if knowledge_index.get("starter_industry"):
+            st.success(
+                f"{knowledge_index['starter_industry']} starter knowledge is active."
+            )
+        for source_name in knowledge_index["documents"]:
+            st.markdown(f"- `{source_name}`")
+        index_backend = knowledge_index.get("backend", "ollama")
+        if index_backend == "tfidf":
+            retrieval_summary = "Retrieval: TF-IDF word and phrase matching"
+        else:
+            retrieval_summary = (
+                f"Retrieval: Ollama semantic embeddings · "
+                f"Model: {knowledge_index['model']}"
+            )
+        st.caption(
+            f"{retrieval_summary} · "
+            f"{len(knowledge_index['chunks'])} chunks · "
+            "stored only for this session"
+        )
+
+        st.markdown("### Test retrieval")
+        retrieval_question = st.text_input(
+            "Question",
+            placeholder="For example: How is allocation rate calculated?",
+            key="knowledge_test_question",
+        )
+        if st.button(
+            "Find relevant passages",
+            disabled=not retrieval_question.strip(),
+            key="test_knowledge_retrieval",
+        ):
+            try:
+                matches = retrieve_knowledge(retrieval_question, knowledge_index)
+                if not matches:
+                    st.info("No sufficiently relevant passage was found.")
+                for number, match in enumerate(matches, start=1):
+                    with st.container(border=True):
+                        st.markdown(
+                            f"**Source {number}: {match['source']} · "
+                            f"{match['location']}**"
+                        )
+                        st.caption(f"Relevance: {match['score']:.1%}")
+                        st.write(match["text"])
+            except KnowledgeBaseError as exc:
+                st.error(str(exc))
+    else:
+        st.info(
+            "Select an industry and click **Load starter knowledge**. No document "
+            "upload is required. Use uploads only when you have organisation-"
+            "specific definitions or policies."
+        )
+
+    st.stop()
+
+
+# ==========================================================
 # DATA SOURCE - FILE OR SUPABASE
 # ==========================================================
 
@@ -546,8 +1489,11 @@ using_database = st.session_state.dataset_source_mode == "Demo database"
 if using_database:
     source_col, refresh_col = st.columns([5, 1])
     with source_col:
-        st.markdown("**Supabase PostgreSQL · `public.demo_sales`**")
-        st.caption("Cloud data is loaded into the existing DataSense AI analysis pipeline.")
+        st.markdown("**Demo sales dataset**")
+        st.caption(
+            "DataSense uses Supabase when available and a bundled synthetic "
+            "sample when database credentials are unavailable."
+        )
     with refresh_col:
         st.button(
             "Refresh data",
@@ -557,26 +1503,41 @@ if using_database:
         )
 
     try:
-        database_df = load_demo_sales()
-        dataset_id = dataframe_dataset_id(database_df, "supabase-demo-sales")
-        activate_dataset(database_df, dataset_id, "Supabase PostgreSQL")
+        database_df, source_info = load_demo_sales_with_fallback()
+        dataset_id = dataframe_dataset_id(
+            database_df,
+            source_info["dataset_key"],
+        )
+        activate_dataset(database_df, dataset_id, source_info["label"])
 
         df = st.session_state.active_df.copy()
-        uploaded_file_name = "Supabase · public.demo_sales"
+        uploaded_file_name = source_info["display_name"]
         uploaded_file_size = int(database_df.memory_usage(deep=True).sum())
-        dataset_source_label = "Database"
+        dataset_source_label = source_info["label"]
         st.session_state.database_last_refreshed_at = pd.Timestamp.now().strftime(
             "%d %b %Y, %I:%M:%S %p"
         )
-        st.success(f"Connected · {len(database_df):,} rows loaded")
-        st.caption(
-            "Last checked: "
-            f"{st.session_state.database_last_refreshed_at} · Click Refresh data after changing Supabase."
-        )
+
+        if source_info["mode"] == "database":
+            st.success(f"Connected · {len(database_df):,} rows loaded")
+            st.caption(
+                "Last checked: "
+                f"{st.session_state.database_last_refreshed_at} · "
+                "Click Refresh data after changing Supabase."
+            )
+        else:
+            st.warning(
+                "Supabase is unavailable, so DataSense loaded its bundled "
+                f"synthetic sample ({len(database_df):,} rows)."
+            )
+            st.caption(
+                "This read-only sample contains no credentials or user data. "
+                "Configure `.streamlit/secrets.toml` to use live Supabase."
+            )
     except Exception as e:
         st.error(
-            "Could not connect to Supabase. Check `.streamlit/secrets.toml` "
-            f"and your network connection. Details: {e}"
+            "Neither Supabase nor the bundled demo dataset could be loaded. "
+            f"Details: {e}"
         )
         st.stop()
 
@@ -1271,9 +2232,12 @@ with panel3:
     insight_rows_html = ""
 
     if grounded_insights:
-        for point in grounded_insights[:4]:
-            safe_text = html.escape(point["text"])
-            insight_rows_html += f'<div class="insight-row">{safe_text}</div>'
+        for point in grounded_insights[:3]:
+            safe_text = html.escape(point.get("summary") or point["text"])
+            full_text = html.escape(point["text"], quote=True)
+            insight_rows_html += (
+                f'<div class="insight-row" title="{full_text}">{safe_text}</div>'
+            )
     else:
         insight_rows_html = '<div class="panel-row-label">No supported automatic insights yet</div>'
 
@@ -1362,6 +2326,18 @@ def render_dataframe_message(message, fallback_key):
             )
             return
 
+        if plan.get("analysis_type") == "patient_count" and len(result_frame) == 1:
+            metric_column = result_frame.columns[0]
+            metric_value = result_frame.iloc[0][metric_column]
+            st.metric(display_column_name(metric_column), f"{int(metric_value):,}")
+
+            audit = message.get("audit") or {}
+            if audit.get("count_basis"):
+                st.caption(f"Count basis: {audit['count_basis']}")
+
+            render_calculation_audit(message)
+            return
+
         display_plan = dict(plan)
         show_chart = bool(display_plan.get("show_chart", False))
 
@@ -1393,8 +2369,146 @@ def render_dataframe_message(message, fallback_key):
             chart_source = message.get("chart_data", result_frame)
             render_chart(chart_source, display_plan)
 
+        if plan.get("analysis_type") == "categorical_relationship":
+            category = next(iter(plan.get("group_by") or []), "Category")
+            measure = plan.get("measure") or "Value"
+            average_column = f"Average {measure}"
+            difference_column = "Difference from Overall %"
+            eta_column = "Association (η²)"
+
+            strength = str(result_frame["Association Strength"].iloc[0])
+            eta_squared = float(result_frame[eta_column].iloc[0])
+            explained_variation = eta_squared * 100
+            explained_text = (
+                "<0.01%"
+                if explained_variation < 0.01
+                else f"{explained_variation:.2f}%"
+            )
+
+            averages = pd.to_numeric(result_frame[average_column], errors="coerce")
+            lowest_average = float(averages.min())
+            highest_average = float(averages.max())
+            average_gap = (
+                (highest_average / lowest_average - 1) * 100
+                if lowest_average != 0 else 0.0
+            )
+
+            if strength.lower() == "negligible":
+                conclusion = (
+                    f"No meaningful relationship was found. Average {measure} "
+                    f"ranges from {lowest_average:,.2f} to {highest_average:,.2f} "
+                    f"across {category} groups—a difference of only {average_gap:.2f}%."
+                )
+            else:
+                conclusion = (
+                    f"A {strength.lower()} relationship was found between "
+                    f"{category} and {measure}. Group averages differ by "
+                    f"{average_gap:.2f}%."
+                )
+
+            st.success(f"**Conclusion:** {conclusion}")
+            st.caption(
+                f"Because {category} is categorical, DataSense compared group "
+                "distributions instead of using Pearson correlation."
+            )
+
+            association_col, variation_col, gap_col = st.columns(3)
+            association_col.metric("Relationship", strength)
+            variation_col.metric("Variation explained", explained_text)
+            gap_col.metric("Largest average gap", f"{average_gap:.2f}%")
+
+            compact_table = result_frame[
+                [category, "Records", average_column, difference_column]
+            ].copy()
+            compact_table["Records"] = compact_table["Records"].map(
+                lambda value: f"{int(value):,}"
+            )
+            compact_table[average_column] = compact_table[average_column].map(
+                lambda value: f"{float(value):,.2f}"
+            )
+            compact_table[difference_column] = compact_table[difference_column].map(
+                lambda value: f"{float(value):+.2f}%"
+            )
+            compact_table = compact_table.rename(
+                columns={difference_column: "Vs overall"}
+            )
+            st.dataframe(compact_table, use_container_width=True, hide_index=True)
+
+            with st.expander("Technical details"):
+                st.write(
+                    "Eta-squared (η²) measures how much numeric variation is "
+                    "associated with differences between category-group averages. "
+                    "Values below 0.01 are considered negligible."
+                )
+                st.code(f"η² = {eta_squared:.6f}")
+                technical_columns = [
+                    category,
+                    f"Median {measure}",
+                    f"Std Dev {measure}",
+                ]
+                st.dataframe(
+                    result_frame[technical_columns],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            render_calculation_audit(message)
+            return
+
     display_frame = result_frame.rename(columns=display_column_name)
     st.dataframe(display_frame, use_container_width=True, hide_index=True)
+    render_calculation_audit(message)
+
+
+def render_calculation_audit(message) -> None:
+    """Expose enough evidence for a user to reproduce a calculated answer."""
+    audit = message.get("audit")
+    if not audit:
+        return
+
+    with st.expander("How this was calculated"):
+        st.markdown("**Calculated by Pandas from the active dataset**")
+        st.caption(
+            "The local LLM planned the request; the displayed values were "
+            "computed from dataset rows rather than generated as text."
+        )
+
+        row_col, used_col, group_col = st.columns(3)
+        row_col.metric("Dataset rows", f"{audit['source_rows']:,}")
+        used_col.metric("Valid rows used", f"{audit['valid_measure_rows']:,}")
+        group_col.metric("Groups compared", f"{audit['groups_evaluated']:,}")
+
+        st.markdown(f"**Formula:** `{audit['formula']}`")
+        if audit.get("count_basis"):
+            st.markdown(f"**Count basis:** `{audit['count_basis']}`")
+        st.markdown(f"**Filters:** `{audit['filters']}`")
+        st.caption(
+            f"Rows after filters: {audit['rows_after_filters']:,} · "
+            f"Sort: {audit['sort']} · Result limit: {audit['limit'] or 'All'}"
+        )
+
+        evidence = message.get("evidence")
+        if isinstance(evidence, pd.DataFrame) and not evidence.empty:
+            st.markdown("**Top comparison used to verify the winner**")
+            st.dataframe(
+                evidence.rename(columns=display_column_name),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+
+def render_knowledge_sources(sources: list[dict] | None) -> None:
+    """Show the exact retrieved passages used for a grounded answer."""
+    if not sources:
+        return
+
+    with st.expander(f"Sources used ({len(sources)})"):
+        for number, source in enumerate(sources, start=1):
+            st.markdown(
+                f"**{number}. {source['source']} · {source['location']}**"
+            )
+            st.caption(f"Retrieval relevance: {source['score']:.1%}")
+            st.write(source["text"])
 
 
 # ==========================================================
@@ -1415,6 +2529,7 @@ with chat_transcript:
             else:
 
                 st.write(message["content"])
+                render_knowledge_sources(message.get("sources"))
 
 
 # ==========================================================
@@ -1565,7 +2680,10 @@ if is_feedback_message(question, previous_plan):
 
 follow_up = is_follow_up(question, previous_plan)
 
-detected_intent = detect_intent(question)
+detected_intent = detect_intent(
+    question,
+    knowledge_available=bool(st.session_state.get("knowledge_index")),
+)
 chart_requested = detected_intent == "VISUALIZE"
 intent = detected_intent
 
@@ -1677,6 +2795,10 @@ For each analysis include:
 - Columns Needed
 """
 
+elif intent == "KNOWLEDGE":
+
+    task = question
+
 elif intent == "SUMMARY":
 
     task = "Statistical Summary"
@@ -1782,8 +2904,19 @@ try:
                     "role": "assistant",
                     "content": result,
                     "plan": dict(plan),
+                    "audit": build_calculation_audit(df, plan),
                     "message_id": f"{dataset_id}_{len(st.session_state.messages)}_{i}",
                 }
+
+                if (
+                    plan.get("analysis_type") == "top_bottom"
+                    and plan.get("limit") == 1
+                ):
+                    evidence_plan = dict(plan)
+                    evidence_plan["limit"] = 5
+                    evidence = calculate(df, evidence_plan)
+                    if isinstance(evidence, pd.DataFrame):
+                        analysis_message["evidence"] = evidence
 
                 if (
                     plan.get("analysis_type") == "correlation"
@@ -1796,6 +2929,15 @@ try:
                             .apply(pd.to_numeric, errors="coerce")
                             .dropna()
                         )
+
+                if (
+                    plan.get("analysis_type") == "categorical_relationship"
+                    and str(plan.get("chart") or "").lower() == "box"
+                ):
+                    category = next(iter(plan.get("group_by") or []), None)
+                    measure = plan.get("measure")
+                    if category in df.columns and measure in df.columns:
+                        analysis_message["chart_data"] = df[[category, measure]].copy()
 
                 st.session_state.messages.append(analysis_message)
 
@@ -1838,6 +2980,62 @@ try:
 
     else:
 
+        knowledge_results = []
+        knowledge_index = st.session_state.get("knowledge_index")
+
+        if intent == "KNOWLEDGE" and not knowledge_index:
+            response = (
+                "I don't have a business knowledge base yet. Open **Knowledge "
+                "Base**, upload a KPI glossary or supporting document, and build "
+                "the local index first."
+            )
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": response,
+            })
+            st.rerun()
+
+        if knowledge_index and intent in {
+            "KNOWLEDGE",
+            "EXPLAIN",
+            "KPI",
+            "ANALYSIS",
+        }:
+            knowledge_results = retrieve_knowledge(
+                question,
+                knowledge_index,
+                top_k=3,
+            )
+
+        if intent == "KNOWLEDGE" and not knowledge_results:
+            response = (
+                "I couldn't find enough support for that answer in the indexed "
+                "knowledge. Add a relevant definition or document and rebuild "
+                "the Knowledge Base."
+            )
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": response,
+            })
+            st.rerun()
+
+        retrieved_context = format_retrieved_context(knowledge_results)
+        grounding_instructions = ""
+        if retrieved_context:
+            grounding_instructions = f"""
+
+Retrieved Business Knowledge
+
+{retrieved_context}
+
+Grounding rules
+
+- Use retrieved knowledge for business definitions, formulas, policies, and targets.
+- Cite supporting passages inline as [Source 1], [Source 2], and so on.
+- Do not claim that a source contains information that is not shown above.
+- If the retrieved knowledge does not support part of the answer, say so clearly.
+"""
+
         response = ask_llm(
 
             system_prompt,
@@ -1846,6 +3044,8 @@ try:
 Dataset Information
 
 {dataset_info}
+
+{grounding_instructions}
 
 Task
 
@@ -1856,13 +3056,15 @@ Task
         st.session_state.messages.append({
 
             "role": "assistant",
-            "content": response
+            "content": response,
+            "sources": knowledge_results,
 
         })
 
         with st.chat_message("assistant", avatar=chat_avatar("assistant")):
 
             st.write(response)
+            render_knowledge_sources(knowledge_results)
 
     # Results were stored in session history. Redraw once so every new answer
     # appears above the composer; this prevents the input and prompt row from

@@ -21,6 +21,7 @@ When database rows change, DataSense AI can refresh the table and rerun the same
 - Stateful follow-up analysis and learned corrections
 - Classification and regression workflows
 - Local LLM integration without a paid AI API
+- Local retrieval-augmented generation (RAG) with visible source passages
 
 ## Current features
 
@@ -28,6 +29,8 @@ When database rows change, DataSense AI can refresh the table and rerun the same
 
 - Upload CSV and XLSX files
 - Connect to `public.demo_sales` in Supabase PostgreSQL
+- Fall back to a bundled, explicitly synthetic sales sample when Supabase
+  credentials are unavailable
 - Refresh database data without restarting the application
 - Detect changed database content and clear stale analysis results
 
@@ -59,6 +62,17 @@ When database rows change, DataSense AI can refresh the table and rerun the same
 - Local Ollama reasoning
 - Experimental learned correction rules
 
+### Business Knowledge RAG
+
+- Built-in starter knowledge for 10 industries with five KPIs per industry
+- Industry-filtered indexing to prevent cross-industry retrieval
+- Upload KPI glossaries, data dictionaries, policies, and business documentation
+- Read PDF, TXT, Markdown, and CSV knowledge sources
+- Create local semantic embeddings with Ollama
+- Retrieve the three most relevant passages for supported questions
+- Ground business definitions, formulas, policies, and targets with inline citations
+- Inspect the exact source passages used for each answer
+
 ### Visualisation
 
 - Normal and 3D charts
@@ -79,12 +93,15 @@ When database rows change, DataSense AI can refresh the table and rerun the same
 flowchart TD
     A[CSV / Excel] --> C[Pandas DataFrame]
     B[Supabase PostgreSQL] --> C
+    J[Business Documents] --> K[Local Ollama Embeddings]
+    K --> L[Session Knowledge Index]
     C --> D[Profile and Quality Checks]
     D --> E[Intent and Query Planning]
     E --> F[Deterministic Pandas Execution]
     F --> G[Insights, Charts, Reports]
     F --> H[Data Science Lab]
-    G --> I[Local Ollama Interpretation]
+    L --> I[Grounded Ollama Interpretation]
+    G --> I
 ```
 
 The LLM helps interpret requests and explain results. Numerical calculations remain in Python/Pandas.
@@ -97,6 +114,7 @@ The LLM helps interpret requests and explain results. Numerical calculations rem
 - Altair and Plotly
 - scikit-learn
 - Ollama with `llama3.2:3b`
+- Ollama `embeddinggemma` embeddings
 - PostgreSQL and Supabase
 - SQLAlchemy and Psycopg
 - pytest
@@ -138,6 +156,7 @@ Install [Ollama](https://ollama.com/) and run:
 
 ```bash
 ollama pull llama3.2:3b
+ollama pull embeddinggemma
 ```
 
 ### 5. Start DataSense AI
@@ -147,6 +166,33 @@ streamlit run app.py
 ```
 
 CSV/Excel analysis works without configuring Supabase.
+
+## Local RAG setup
+
+1. Open **Knowledge Base** in the DataSense AI sidebar.
+2. Select one of the 10 built-in industries.
+3. Click **Load starter knowledge**. No file upload is required.
+4. Test retrieval on the same page, then return to **Workspace** and ask a
+   definition, formula, policy, or documentation question.
+
+The bundled `data/kpi_glossary_sample.csv` contains 50 starter KPIs across
+Retail & E-commerce, EdTech, Hospitality, Marketing, Sales & CRM, Finance &
+Banking, Healthcare, Manufacturing, Logistics & Fleet, and SaaS & Product
+Analytics. DataSense indexes only the selected industry's rows.
+
+Users can still upload PDF, TXT, Markdown, or CSV documents when they need
+company-specific definitions and policies. Uploaded text and embeddings stay
+in the current Streamlit session. The knowledge index is cleared when the
+session ends or the user clicks **Clear**.
+
+DataSense uses RAG for business meaning and Pandas for numerical results. It
+does not treat retrieved text as proof of a dataset value.
+
+The **Demo database** option is also safe to open without credentials. DataSense
+tries Supabase first; if the connection is unavailable, it loads
+`data/demo_sales_sample.csv` and labels the source **Bundled sample**. This
+keeps a public portfolio deployment interactive without exposing database
+secrets or pretending that sample rows came from a live system.
 
 ## Optional Supabase database setup
 

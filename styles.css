@@ -1095,12 +1095,16 @@ div[data-testid="metric-container"]:hover, div[data-testid="stMetric"]:hover {
 }
 
 .insight-row {
+    display: -webkit-box;
     margin-bottom: 12px;
+    overflow: hidden;
     padding-left: 9px;
     color: #dce3f7;
     font-size: 11.5px;
     line-height: 1.5;
     border-left: 2px solid rgba(124, 92, 255, .5);
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 3;
 }
 
 div[data-testid="stMetric"] {
@@ -1446,5 +1450,108 @@ button[kind="primary"], button[data-testid="baseButton-primary"] {
         animation: none !important;
         opacity: 1 !important;
         transform: none !important;
+    }
+}
+
+/* ==========================================================
+   AUTH LANDING â€” STRONGER PAGE / TOUR SEPARATION
+   Applied only while the DataSense quick-tour auth screen is present.
+   The normal signed-in workspace keeps the original theme above.
+   ========================================================== */
+
+/* Softer blue-glass canvas around the auth experience. */
+body:has(.ds-tour-shell) .stApp {
+    background:
+        radial-gradient(circle at 10% 12%, rgba(112, 181, 255, .30), transparent 31rem),
+        radial-gradient(circle at 83% 8%, rgba(133, 105, 255, .24), transparent 27rem),
+        radial-gradient(circle at 52% 94%, rgba(231, 242, 255, .10), transparent 30rem),
+        linear-gradient(
+            135deg,
+            #0b1832 0%,
+            #102246 34%,
+            #171d46 66%,
+            #0a1730 100%
+        ) !important;
+}
+
+/* A restrained frosted-light layer makes the outer canvas visibly
+   different from the dark product-tour screen without becoming bright. */
+body:has(.ds-tour-shell) .stApp::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    background:
+        linear-gradient(115deg, rgba(213, 232, 255, .055), transparent 34%),
+        radial-gradient(circle at 72% 34%, rgba(255, 255, 255, .035), transparent 24rem);
+    backdrop-filter: saturate(112%);
+    -webkit-backdrop-filter: saturate(112%);
+}
+
+/* Keep Streamlit content above the decorative auth background. */
+body:has(.ds-tour-shell) .stApp > * {
+    position: relative;
+    z-index: 1;
+}
+
+/* Make the quick-tour behave like a dark screen floating on the lighter canvas. */
+body:has(.ds-tour-shell) .ds-tour-shell {
+    background:
+        radial-gradient(circle at 76% 12%, rgba(94, 70, 214, .12), transparent 21rem),
+        linear-gradient(150deg, #020712 0%, #050a1a 46%, #070b20 100%) !important;
+    border: 1px solid rgba(135, 178, 255, .30) !important;
+    box-shadow:
+        0 32px 80px rgba(0, 0, 0, .46),
+        0 0 0 1px rgba(255, 255, 255, .025) inset,
+        0 0 54px rgba(73, 118, 255, .16),
+        -20px 20px 75px rgba(34, 211, 238, .07) !important;
+}
+
+/* Slightly stronger top-bar contrast inside the tour window. */
+body:has(.ds-tour-shell) .ds-tour-topbar {
+    background:
+        linear-gradient(180deg, rgba(22, 31, 68, .96), rgba(7, 12, 30, .98)) !important;
+    border-bottom-color: rgba(145, 177, 255, .20) !important;
+}
+
+/* Keep the assistant side airy instead of turning it into another card. */
+body:has(.ds-tour-shell) .ds-assistant-row {
+    background: transparent !important;
+}
+
+/* Speech bubble gets a subtle glass-blue treatment to belong to the outer canvas. */
+body:has(.ds-tour-shell) .ds-speech {
+    background: rgba(15, 31, 67, .58) !important;
+    border-color: rgba(145, 181, 255, .24) !important;
+    box-shadow:
+        0 16px 38px rgba(0, 0, 0, .18),
+        inset 0 1px 0 rgba(255, 255, 255, .035) !important;
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+}
+
+body:has(.ds-tour-shell) .ds-speech::before {
+    background: rgba(15, 31, 67, .58) !important;
+}
+
+/* Give the auth buttons a little more separation from the page without
+   increasing their size. */
+body:has(.ds-tour-shell) .stButton > button {
+    box-shadow: 0 14px 30px rgba(1, 7, 24, .16) !important;
+}
+
+body:has(.ds-tour-shell) button[kind="primary"],
+body:has(.ds-tour-shell) button[data-testid="baseButton-primary"] {
+    box-shadow:
+        0 12px 30px rgba(91, 63, 222, .30),
+        0 0 24px rgba(124, 92, 255, .10) !important;
+}
+
+@media (max-width: 900px) {
+    body:has(.ds-tour-shell) .stApp {
+        background:
+            radial-gradient(circle at 50% 0%, rgba(92, 156, 255, .24), transparent 24rem),
+            linear-gradient(160deg, #0b1730, #111c3d 58%, #0a142b) !important;
     }
 }

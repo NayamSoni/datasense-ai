@@ -10,3 +10,5 @@ streamlit-sortables>=0.3
 plotly>=5.24
 SQLAlchemy>=2.0
 psycopg[binary]>=3.2
+pypdf>=5.0
+supabase>=2.31.0,<3.0

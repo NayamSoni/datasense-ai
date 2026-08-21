@@ -147,12 +147,13 @@ def _render_pivot_chart(result, group_by, chart_type):
 # Distribution charts (Range / Count table)
 # ======================================================
 
-def _render_distribution_chart(result):
+def _render_distribution_chart(result, measure=None):
 
     base = alt.Chart(result)
+    bucket_title = f"{measure} bucket" if measure else "Range"
     bars = base.mark_bar(color=BAR_COLOR, cornerRadiusTopLeft=4, cornerRadiusTopRight=4).encode(
-        x=alt.X("Range:N", sort=None, title=None),
-        y=alt.Y("Count:Q"),
+        x=alt.X("Range:N", sort=None, title=bucket_title),
+        y=alt.Y("Count:Q", title="Record count"),
         tooltip=["Range", "Count"] + (
             ["Percent"] if "Percent" in result.columns else []
         )
@@ -163,8 +164,8 @@ def _render_distribution_chart(result):
         color=LABEL_COLOR,
         fontSize=11,
     ).encode(
-        x=alt.X("Range:N", sort=None, title=None),
-        y=alt.Y("Count:Q"),
+        x=alt.X("Range:N", sort=None, title=bucket_title),
+        y=alt.Y("Count:Q", title="Record count"),
         text=alt.Text("Count:Q", format=",.0f"),
     )
 
@@ -551,6 +552,41 @@ def _render_correlation_scatter(data, plan):
     return True
 
 
+def _render_categorical_relationship_box(data, plan):
+    """Show a numeric distribution across an unordered category."""
+    measure = plan.get("measure")
+    category = next(
+        (column for column in (plan.get("group_by") or []) if column in data.columns),
+        None,
+    )
+    if not measure or measure not in data.columns or not category:
+        return False
+
+    clean = data[[category, measure]].copy()
+    clean[measure] = pd.to_numeric(clean[measure], errors="coerce")
+    clean = clean.dropna()
+    if len(clean) < 3 or clean[category].nunique() < 2:
+        return False
+
+    plotted = clean.sample(10000, random_state=42) if len(clean) > 10000 else clean
+    chart = (
+        alt.Chart(plotted)
+        .mark_boxplot(
+            extent=1.5,
+            color=BAR_COLOR,
+            median={"color": "#f8fafc"},
+        )
+        .encode(
+            x=alt.X(f"{category}:N", title=category, sort=None),
+            y=alt.Y(f"{measure}:Q", title=measure, scale=alt.Scale(zero=False)),
+            tooltip=[alt.Tooltip(f"{category}:N", title=category)],
+        )
+        .properties(height=460)
+    )
+    st.altair_chart(chart, use_container_width=True)
+    return True
+
+
 # ======================================================
 # Public Entry Point (used by the AI chat / execution-plan flow)
 # ======================================================
@@ -579,6 +615,11 @@ def render_chart(result, plan):
             _render_correlation_scatter(result, plan)
         return
 
+    if analysis_type == "categorical_relationship":
+        if chart_type == "box":
+            _render_categorical_relationship_box(result, plan)
+        return
+
     if chart_type in ("box", "treemap"):
         return
 
@@ -589,7 +630,7 @@ def render_chart(result, plan):
             return
 
         if analysis_type == "distribution" and {"Range", "Count"}.issubset(result.columns):
-            _render_distribution_chart(result)
+            _render_distribution_chart(result, plan.get("measure"))
             return
 
         _render_simple_chart(result, plan, chart_type)

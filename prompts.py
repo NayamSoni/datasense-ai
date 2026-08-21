@@ -104,7 +104,7 @@ Return JSON in this format
 {
 "title":"",
 
-"analysis_type":"aggregation|top_bottom|time_series|mom|yoy|pareto|pivot|distribution|correlation|outlier",
+"analysis_type":"aggregation|top_bottom|time_series|mom|yoy|pareto|pivot|distribution|correlation|categorical_relationship|outlier",
 
 "operation":"sum|mean|median|min|max|count|std|nunique",
 
@@ -131,6 +131,12 @@ Return JSON in this format
 "measure2" is ONLY used for analysis_type "correlation"
 (e.g. correlation between Discount and Profit ->
 measure="Discount", measure2="Profit"). Leave it null otherwise.
+
+Use "categorical_relationship" when a relationship/correlation question has
+one numeric field and one categorical field. Put the numeric field in
+"measure", the categorical field in "group_by", leave "measure2" null, use
+operation="mean", and chart="box". Example: Billing Amount versus Admission
+Type is a categorical relationship, not a Pearson correlation.
 
 ------------------------------------------------------------
 Rules

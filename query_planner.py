@@ -3,7 +3,7 @@ import re
 
 import pandas as pd
 
-print("### QUERY_PLANNER.PY LOADED — VERSION 2026-07-21-v6 (deterministic Average Order Value planning) ###")
+print("### QUERY_PLANNER.PY LOADED — VERSION 2026-08-19-v12 (mixed-type relationships) ###")
 
 from prompts import CALCULATION_PROMPT
 
@@ -237,6 +237,26 @@ def apply_rule_engine(question, plan):
 
         plan["analysis_type"] = "top_bottom"
 
+    elif (
+        re.search(
+            r"\b(highest|largest|greatest|maximum|lowest|smallest|minimum)\b",
+            question_lower,
+        )
+        and (
+            re.search(r"\b(which|who)\b", question_lower)
+            or re.search(r"\b(has|have|with)\b", question_lower)
+        )
+    ):
+
+        plan["analysis_type"] = "top_bottom"
+        plan["limit"] = 1
+        plan["chart"] = "table"
+        plan["sort"] = (
+            "asc"
+            if re.search(r"\b(lowest|smallest|minimum)\b", question_lower)
+            else "desc"
+        )
+
     elif any(x in q for x in [
         "month over month",
         "mom"
@@ -281,13 +301,12 @@ def apply_rule_engine(question, plan):
 
         plan["analysis_type"] = "outlier"
 
-    elif any(x in q for x in [
-        "distribution",
-        "histogram",
-        "spread of"
-    ]):
+    elif is_distribution_question(question_lower):
 
         plan["analysis_type"] = "distribution"
+        plan["operation"] = "count"
+        plan["group_by"] = []
+        plan["chart"] = "histogram"
 
     elif any(x in q for x in [
         "trend",
@@ -484,6 +503,8 @@ def normalize_plan(plan):
 
         "order_column": plan.get("order_column"),
 
+        "patient_column": plan.get("patient_column"),
+
         "metric_label": plan.get("metric_label"),
 
         "group_by": plan.get("group_by", []),
@@ -522,7 +543,10 @@ DIMENSION_KEYWORDS = [
     "ship mode",
     "shipping",
     "brand",
-    "channel"
+    "channel",
+    "hospital",
+    "facility",
+    "provider",
 ]
 
 
@@ -545,6 +569,53 @@ def is_average_order_value_question(question):
     )
 
     return any(phrase in normalized for phrase in explicit_phrases)
+
+
+def is_patient_count_question(question):
+    """Return True when the request is asking for a patient population count."""
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(question).lower()).strip()
+    if is_distribution_question(normalized):
+        return False
+    patterns = (
+        r"\bnumber of patients\b",
+        r"\bhow many patients\b",
+        r"\bpatient count\b",
+        r"\btotal patients\b",
+        r"\bpatients admitted\b",
+        r"\badmitted patients\b",
+    )
+    return any(re.search(pattern, normalized) for pattern in patterns)
+
+
+def is_distribution_question(question):
+    """Recognise formal and conversational requests for numeric buckets."""
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(question).lower()).strip()
+    direct_terms = (
+        "histogram",
+        "distribution",
+        "spread of",
+        "frequency chart",
+        "frequency distribution",
+        "bucket",
+        "buckets",
+        "binned",
+        "bins",
+        "age band",
+        "age bands",
+        "age range",
+        "age ranges",
+        "group the ages",
+        "group ages",
+    )
+    if any(term in normalized for term in direct_terms):
+        return True
+
+    conversational_patterns = (
+        r"\bhow many\b.+\b(?:each|every)\b.+\b(?:range|group|band)\b",
+        r"\b(?:group|split|divide)\b.+\binto\b.+\b(?:ranges|groups|bands)\b",
+        r"\b(?:plot|chart|show)\b.+\b(?:frequency|spread)\b",
+    )
+    return any(re.search(pattern, normalized) for pattern in conversational_patterns)
 
 
 def _detect_order_identifier(df):
@@ -581,6 +652,36 @@ def _detect_order_identifier(df):
     fallback = resolve_business_column(df, "order")
     if fallback is not None and "date" not in str(fallback).lower():
         return fallback
+
+    return None
+
+
+def _detect_patient_identifier(df):
+    """Find a stable patient identifier; names are intentionally excluded."""
+    normalized_columns = {
+        re.sub(r"[^a-z0-9]+", " ", str(column).lower()).strip(): column
+        for column in df.columns
+    }
+
+    exact_names = (
+        "patient id",
+        "patient identifier",
+        "patient number",
+        "patient no",
+        "medical record number",
+        "medical record no",
+        "mrn",
+    )
+    for name in exact_names:
+        if name in normalized_columns:
+            return normalized_columns[name]
+
+    for normalized_name, column in normalized_columns.items():
+        tokens = normalized_name.split()
+        if "patient" in tokens and any(
+            token in tokens for token in ("id", "identifier", "number", "no")
+        ):
+            return column
 
     return None
 
@@ -672,6 +773,102 @@ def _numeric_columns_mentioned(df, question):
     return list(dict.fromkeys(column for _, column in matches))
 
 
+def _categorical_columns_mentioned(df, question):
+    """Return non-date categorical columns explicitly named by the user."""
+    normalized = re.sub(r"[^a-z0-9]+", " ", question.lower()).strip()
+    excluded_dates = set(date_columns(df))
+    matches = []
+
+    for column in df.select_dtypes(exclude="number").columns:
+        if column in excluded_dates:
+            continue
+        column_text = re.sub(r"[^a-z0-9]+", " ", str(column).lower()).strip()
+        if not column_text:
+            continue
+        pattern = rf"\b{re.escape(column_text)}(?:s|es)?\b"
+        match = re.search(pattern, normalized)
+        if match:
+            matches.append((match.start(), column))
+
+    matches.sort(key=lambda item: item[0])
+    return list(dict.fromkeys(column for _, column in matches))
+
+
+def _literal_categorical_filters(df, question):
+    """Find low-cardinality dataset values explicitly named in a question.
+
+    This deterministic pass catches filters such as ``Medicare`` even when a
+    small local model omits the filter from its JSON plan. High-cardinality
+    columns are skipped to avoid scanning identifiers and free-text fields.
+    """
+    normalized_question = re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        str(question).lower(),
+    ).strip()
+    matches = []
+
+    for column in df.select_dtypes(exclude="number").columns:
+        values = (
+            df[column]
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .drop_duplicates()
+        )
+        if len(values) == 0 or len(values) > 250:
+            continue
+
+        ordered_values = sorted(values, key=lambda value: len(value), reverse=True)
+        for value in ordered_values:
+            normalized_value = re.sub(
+                r"[^a-z0-9]+",
+                " ",
+                value.lower(),
+            ).strip()
+            if len(normalized_value) < 2:
+                continue
+            if re.search(rf"\b{re.escape(normalized_value)}\b", normalized_question):
+                matches.append({"column": column, "value": value})
+                break
+
+    return matches
+
+
+def _canonical_filter_value(df, column, value):
+    """Return the dataset's exact categorical value or reject the filter.
+
+    Small local models sometimes turn a real value such as ``Urgent`` into
+    ``Urgent cases``. Keeping that invented value creates an empty AND filter
+    even when the deterministic literal detector also finds ``Urgent``.
+    """
+    if value is None or column not in df.columns:
+        return None
+
+    if pd.api.types.is_numeric_dtype(df[column]):
+        return value
+
+    normalized_value = re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        str(value).lower(),
+    ).strip()
+    if not normalized_value:
+        return None
+
+    values = df[column].dropna().drop_duplicates()
+    for candidate in values:
+        normalized_candidate = re.sub(
+            r"[^a-z0-9]+",
+            " ",
+            str(candidate).lower(),
+        ).strip()
+        if normalized_candidate == normalized_value:
+            return candidate
+
+    return None
+
+
 # ==========================================================
 # Semantic Resolution
 # ==========================================================
@@ -702,6 +899,13 @@ def resolve_plan(df, plan, question=""):
     # user's question, so "units sold" reliably maps to Quantity even if the
     # small local model selected Sales or left the measure blank.
     question_lower = question.lower()
+    mentioned_numeric_columns = _numeric_columns_mentioned(df, question)
+    if mentioned_numeric_columns:
+        # Direct column evidence from the user's words outranks a model/default
+        # measure. This makes conversational requests such as "age buckets"
+        # resolve to Age instead of the dataset's primary amount column.
+        plan["measure"] = mentioned_numeric_columns[0]
+
     explicit_measures = (
         (("units sold", "unit sold", "units", "quantity", "qty", "volume"), "quantity"),
         (("profit", "margin", "earnings"), "profit"),
@@ -748,6 +952,43 @@ def resolve_plan(df, plan, question=""):
                 f"does not contain {', '.join(missing)}."
             )
 
+    # A patient count is not a sum of the Admission Type text column. Filter
+    # the requested category first, then count distinct patient identifiers.
+    # If the dataset has no stable patient ID, calculate admission rows and
+    # label that fallback explicitly so it is not presented as unique people.
+    if is_patient_count_question(question_lower):
+        patient_column = _detect_patient_identifier(df)
+        plan.update({
+            "title": question.strip().rstrip("?") or "Patient Count",
+            "analysis_type": "patient_count",
+            "operation": "nunique" if patient_column else "count_rows",
+            "measure": patient_column,
+            "patient_column": patient_column,
+            "metric_label": (
+                "Distinct Patients" if patient_column else "Patient Admission Records"
+            ),
+            "group_by": [],
+            "sort": None,
+            "limit": None,
+            "pivot": False,
+            "chart": "kpi",
+        })
+
+    if is_distribution_question(question_lower):
+        plan.update({
+            "title": (
+                f"{plan['measure']} Distribution"
+                if plan.get("measure") else "Numeric Distribution"
+            ),
+            "analysis_type": "distribution",
+            "operation": "count",
+            "group_by": [],
+            "sort": None,
+            "limit": None,
+            "pivot": False,
+            "chart": "histogram",
+        })
+
     # -------------------------------
     # Measure 2 (correlation only)
     # -------------------------------
@@ -769,9 +1010,38 @@ def resolve_plan(df, plan, question=""):
         "correlation", "correlate", "relationship between"
     )):
         correlation_columns = _numeric_columns_mentioned(df, question)
+        categorical_columns = _categorical_columns_mentioned(df, question)
+
+        # Preserve a categorical field supplied correctly by the local model,
+        # even when the user's wording is a synonym rather than the exact
+        # dataset header.
+        resolved_measure2 = plan.get("measure2")
+        if (
+            not categorical_columns
+            and resolved_measure2 in df.columns
+            and not pd.api.types.is_numeric_dtype(df[resolved_measure2])
+            and resolved_measure2 not in set(date_columns(df))
+        ):
+            categorical_columns = [resolved_measure2]
+
         if len(correlation_columns) >= 2:
             plan["measure"] = correlation_columns[0]
             plan["measure2"] = correlation_columns[1]
+        elif correlation_columns and categorical_columns:
+            numeric_column = correlation_columns[0]
+            category_column = categorical_columns[0]
+            plan.update({
+                "title": f"{numeric_column} by {category_column}",
+                "analysis_type": "categorical_relationship",
+                "operation": "mean",
+                "measure": numeric_column,
+                "measure2": None,
+                "group_by": [category_column],
+                "sort": "desc",
+                "limit": None,
+                "pivot": False,
+                "chart": "box",
+            })
         elif plan.get("measure2") == plan.get("measure"):
             plan["measure2"] = None
 
@@ -862,17 +1132,36 @@ def resolve_plan(df, plan, question=""):
 
         )
 
-        if column:
+        canonical_value = _canonical_filter_value(
+            df,
+            column,
+            f.get("value"),
+        ) if column else None
+
+        if column and canonical_value is not None:
 
             valid_filters.append({
 
                 "column": column,
 
-                "value": f.get("value")
+                "value": canonical_value
 
             })
 
     plan["filters"] = valid_filters
+
+    existing_filters = {
+        (item["column"], str(item.get("value", "")).casefold())
+        for item in plan["filters"]
+    }
+    for detected_filter in _literal_categorical_filters(df, question):
+        identity = (
+            detected_filter["column"],
+            str(detected_filter["value"]).casefold(),
+        )
+        if identity not in existing_filters:
+            plan["filters"].append(detected_filter)
+            existing_filters.add(identity)
 
     # -------------------------------
     # Smart Defaults
@@ -890,7 +1179,7 @@ def resolve_plan(df, plan, question=""):
         "as a whole"
     ])
 
-    if not plan["group_by"]:
+    if not plan["group_by"] and plan["analysis_type"] != "patient_count":
 
         dim = None
 
@@ -938,6 +1227,18 @@ def resolve_plan(df, plan, question=""):
 
             dim = resolve_dimension(df, "channel")
 
+        elif "hospital" in q:
+
+            dim = resolve_dimension(df, "hospital")
+
+        elif "facility" in q:
+
+            dim = resolve_dimension(df, "facility")
+
+        elif "provider" in q:
+
+            dim = resolve_dimension(df, "provider")
+
         elif needs_fallback_dimension and not wants_overall:
 
             dim = detect_dimension(df)
@@ -945,6 +1246,29 @@ def resolve_plan(df, plan, question=""):
         if dim:
 
             plan["group_by"] = [dim]
+
+    # A request such as "which hospital has the highest billing amount" means
+    # rank hospitals by their aggregated billing, not return the maximum value
+    # from one individual row. Preserve explicit average/count/single-record
+    # wording; otherwise use SUM at the entity grain.
+    if plan["analysis_type"] == "top_bottom" and plan["group_by"]:
+        explicit_non_sum = any(phrase in question_lower for phrase in (
+            "average",
+            "mean",
+            "median",
+            "count",
+            "number of",
+            "single bill",
+            "individual bill",
+            "single transaction",
+            "individual transaction",
+            "single record",
+        ))
+        if not explicit_non_sum and re.search(
+            r"\b(highest|largest|greatest|maximum|lowest|smallest|minimum)\b",
+            question_lower,
+        ):
+            plan["operation"] = "sum"
 
     # -------------------------------
     # Explicit Year Detection / Validation
@@ -1033,7 +1357,7 @@ def create_execution_plan(user_question, df):
 
     if not raw_plans:
 
-        return [
+        raw_plans = [
 
             {
 
@@ -1069,6 +1393,18 @@ def create_execution_plan(user_question, df):
 
         try:
 
+            # Apply deterministic language rules before semantic resolution.
+            # Resolution can then select the correct dataset column for the
+            # chosen intent. Applying rules only afterward left stale default
+            # measures behind (for example Billing Amount in an Age histogram).
+            raw = apply_rule_engine(
+
+                user_question,
+
+                raw
+
+            )
+
             plan = resolve_plan(
 
                 df,
@@ -1076,14 +1412,6 @@ def create_execution_plan(user_question, df):
                 raw,
 
                 question=user_question
-
-            )
-
-            plan = apply_rule_engine(
-
-                user_question,
-
-                plan
 
             )
 

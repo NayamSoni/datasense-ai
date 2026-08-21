@@ -57,119 +57,93 @@ def _fmt(value):
     return f"{value:,.2f}"
 
 
+def _first_sentence(text: str) -> str:
+    """Return one complete sentence without cutting a decimal percentage."""
+    sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z])", str(text).strip())
+    return sentences[0].strip() if sentences else ""
+
+
+def _dashboard_insight_summary(finding: dict, max_chars: int = 180) -> str:
+    """Create a compact, evidence-backed preview for the workspace card.
+
+    The full finding remains available on the Insights page. This summary is
+    deliberately deterministic so the dashboard cannot invent or paraphrase a
+    number differently from the calculated report.
+    """
+    title = str(finding.get("title", "")).strip()
+    evidence = str(finding.get("evidence", "")).strip()
+    finding_type = finding.get("type")
+
+    if finding_type == "calendar_effect":
+        evidence_sentences = re.split(
+            r"(?<=[.!?])\s+(?=[A-Z])",
+            evidence,
+        )
+        adjusted_sentence = next(
+            (
+                sentence.strip()
+                for sentence in evidence_sentences
+                if "after dividing" in sentence.lower()
+                or "adjust" in sentence.lower()
+            ),
+            _first_sentence(evidence),
+        )
+        summary = f"{title}. {adjusted_sentence}"
+    elif finding_type == "segment_driver":
+        # The evidence already contains the segment, change and contribution;
+        # repeating the long title adds little value in a narrow card.
+        summary = _first_sentence(evidence) or title
+    else:
+        evidence_sentence = _first_sentence(evidence)
+        summary = f"{title}. {evidence_sentence}" if evidence_sentence else title
+
+    summary = re.sub(r"\bmonth over month\b", "MoM", summary, flags=re.I)
+    summary = re.sub(r"\byear over year\b", "YoY", summary, flags=re.I)
+    summary = re.sub(r"\s+", " ", summary).strip()
+
+    if len(summary) <= max_chars:
+        return summary
+
+    shortened = summary[: max_chars - 1].rsplit(" ", 1)[0].rstrip(".,;:")
+    return f"{shortened}…"
+
+
 def generate_business_insights(df: pd.DataFrame, limit: int = 5) -> list[dict]:
-    """Generate concise insights only from values calculated from the dataset."""
-    insights = []
+    """Return the same guarded findings used by the full decision report."""
     if df.empty:
-        return insights
+        return []
 
-    measure = detect_primary_measure(df)
-    date_col = detect_date_column(df)
-    dimension = _primary_dimension(df, date_col)
-
-    if measure and date_col:
-        dates = pd.to_datetime(df[date_col], errors="coerce")
-        work = df.loc[dates.notna(), [measure]].copy()
-        work["_date"] = dates[dates.notna()]
-        work["_quarter"] = work["_date"].dt.to_period("Q")
-        quarterly = work.groupby("_quarter")[measure].sum().sort_index()
-        if len(quarterly) >= 2 and quarterly.iloc[-2] != 0:
-            growth = (quarterly.iloc[-1] / quarterly.iloc[-2] - 1) * 100
-            insights.append({
-                "type": "period_growth",
-                "text": (
-                    f"{measure} {'increased' if growth >= 0 else 'decreased'} "
-                    f"{abs(growth):.1f}% in {quarterly.index[-1]} versus {quarterly.index[-2]}."
-                ),
-                "evidence": {"growth_pct": round(growth, 2), "measure": measure},
-            })
-
-        work["_month"] = work["_date"].dt.month
-        monthly = work.groupby("_month")[measure].sum()
-        if not monthly.empty and monthly.sum() != 0:
-            peak_month = int(monthly.idxmax())
-            share = monthly.max() / monthly.sum() * 100
-            insights.append({
-                "type": "seasonality",
-                "text": f"{measure} is highest in {calendar.month_name[peak_month]}, contributing {share:.1f}% of the monthly total.",
-                "evidence": {"month": calendar.month_name[peak_month], "share_pct": round(share, 2)},
-            })
-
-    if measure and dimension and dimension != date_col:
-        grouped = df.groupby(dimension, dropna=False)[measure].sum().sort_values(ascending=False)
-        if not grouped.empty and grouped.sum() != 0:
-            top_name, top_value = grouped.index[0], grouped.iloc[0]
-            contribution = top_value / grouped.sum() * 100
-            insights.append({
-                "type": "concentration",
-                "text": f"{top_name} leads {dimension} with {_fmt(top_value)} {measure}, contributing {contribution:.1f}%.",
-                "evidence": {"dimension": dimension, "leader": str(top_name), "share_pct": round(contribution, 2)},
-            })
-
-    revenue = _named_column(df, ["revenue", "sales", "net sales"])
-    profit = _named_column(df, ["profit", "gross profit", "net profit"])
-    category = _dimension_column(df, ["category"])
-    geography = _dimension_column(df, ["state", "region", "city", "country"])
-
-    if profit and geography:
-        geo = df.groupby(geography, dropna=False)[profit].sum().sort_values(ascending=False)
-        if not geo.empty:
-            insights.append({
-                "type": "top_geography",
-                "text": f"{geo.index[0]} has the highest {profit} at {_fmt(geo.iloc[0])}.",
-                "evidence": {"geography": geography, "leader": str(geo.index[0]), "value": float(geo.iloc[0])},
-            })
-
-    if revenue and profit and category and revenue != profit:
-        margin = df.groupby(category)[[revenue, profit]].sum()
-        margin = margin[margin[revenue] != 0]
-        if not margin.empty:
-            margin["_margin"] = margin[profit] / margin[revenue] * 100
-            lowest = margin["_margin"].idxmin()
-            insights.append({
-                "type": "low_margin",
-                "text": f"{lowest} has the lowest {category} margin at {margin.loc[lowest, '_margin']:.1f}%.",
-                "evidence": {"category": category, "lowest": str(lowest), "margin_pct": round(float(margin.loc[lowest, "_margin"]), 2)},
-            })
-
-    discount = _named_column(df, ["discount", "discount rate"])
-    if discount and profit and discount != profit:
-        pair = df[[discount, profit]].dropna()
-        if len(pair) >= 3 and pair[discount].nunique() > 1 and pair[profit].nunique() > 1:
-            corr = pair[discount].corr(pair[profit])
-            if pd.notna(corr) and abs(corr) >= 0.20:
-                direction = "negative" if corr < 0 else "positive"
-                insights.append({
-                    "type": "discount_profit",
-                    "text": f"{discount} and {profit} have a {direction} correlation of {corr:.2f}.",
-                    "evidence": {"correlation": round(float(corr), 3)},
-                })
-
-    return insights[:limit]
+    report = generate_decision_report(
+        df,
+        max_findings=limit,
+        max_recommendations=limit,
+    )
+    recommendation_by_evidence = {
+        item["evidence"]: item["action"]
+        for item in report["recommendations"]
+    }
+    return [
+        {
+            "type": finding["type"],
+            "summary": _dashboard_insight_summary(finding),
+            "text": (
+                f"{finding['title']}. {finding['evidence']} "
+                f"{finding.get('meaning', '')}"
+            ).strip(),
+            "evidence": finding,
+            "recommendation": recommendation_by_evidence.get(finding["evidence"]),
+        }
+        for finding in report["findings"][:limit]
+    ]
 
 
 def generate_recommendations(insights: list[dict], limit: int = 4) -> list[str]:
-    """Translate grounded findings into cautious, consultant-style actions."""
-    recommendations = []
-    for insight in insights:
-        kind, evidence = insight["type"], insight.get("evidence", {})
-        if kind == "period_growth":
-            if evidence.get("growth_pct", 0) >= 0:
-                recommendations.append("Plan capacity and inventory around the latest period's demonstrated growth.")
-            else:
-                recommendations.append("Review segment and product drivers behind the latest period's decline.")
-        elif kind == "seasonality":
-            recommendations.append(f"Prepare inventory, staffing, and campaigns ahead of {evidence.get('month')}.")
-        elif kind == "concentration":
-            recommendations.append(f"Protect performance in {evidence.get('leader')} while reducing over-concentration risk.")
-        elif kind == "top_geography":
-            recommendations.append(f"Test premium or retention campaigns in {evidence.get('leader')}, the strongest geography.")
-        elif kind == "low_margin":
-            recommendations.append(f"Review pricing, discounting, and costs for {evidence.get('lowest')} before pursuing more volume.")
-        elif kind == "discount_profit" and evidence.get("correlation", 0) < 0:
-            recommendations.append("Review discount thresholds and require margin checks before deeper discounting.")
-
-    # De-duplicate while keeping the evidence-driven priority order.
+    """Return only recommendations that passed the decision-report guardrails."""
+    recommendations = [
+        insight.get("recommendation")
+        for insight in insights
+        if insight.get("recommendation")
+    ]
     return list(dict.fromkeys(recommendations))[:limit]
 
 
@@ -182,8 +156,12 @@ def _normal_name(column) -> str:
 
 
 def _business_metrics(df: pd.DataFrame) -> list:
-    """Return useful numeric metrics while excluding obvious identifiers."""
-    excluded = (" id", "id ", "row id", "index", "postal", "zip", "code")
+    """Return numeric business measures while excluding identifier-like fields."""
+    excluded = (
+        " id", "id ", "identifier", "row id", "index", "postal", "zip",
+        "code", "phone", "account number", "order number", "invoice number",
+        "transaction number", "room number", "rank",
+    )
     metrics = []
     for column in df.select_dtypes(include="number").columns:
         name = f" {_normal_name(column)} "
@@ -195,8 +173,10 @@ def _business_metrics(df: pd.DataFrame) -> list:
 
 def _important_dimensions(df: pd.DataFrame, date_col=None) -> list:
     preferred_words = (
-        "category", "product", "segment", "region", "state", "city",
-        "country", "channel", "customer", "employee", "agent", "brand",
+        "category", "segment", "product", "admission type", "medical condition",
+        "insurance provider", "region", "state", "country", "city", "channel",
+        "status", "type", "department", "brand", "test result", "medication",
+        "gender", "customer", "employee", "agent",
     )
     candidates = []
     for column in df.select_dtypes(exclude="number").columns:
@@ -206,7 +186,7 @@ def _important_dimensions(df: pd.DataFrame, date_col=None) -> list:
         if not 2 <= unique <= min(100, max(2, len(df) // 2)):
             continue
         name = _normal_name(column)
-        score = next((20 - i for i, word in enumerate(preferred_words) if word in name), 0)
+        score = next((100 - i for i, word in enumerate(preferred_words) if word in name), 0)
         candidates.append((score, -unique, str(column), column))
     candidates.sort(reverse=True)
     return [column for _, _, _, column in candidates]
@@ -222,6 +202,48 @@ def _is_additive_metric(column) -> bool:
         "sales", "revenue", "profit", "cost", "expense", "amount",
         "quantity", "units", "volume", "orders", "count", "income",
     ))
+
+
+def _entity_identifier(df: pd.DataFrame):
+    """Return a stable entity/transaction identifier when its name proves it."""
+    exact = (
+        "order id", "transaction id", "invoice id", "patient id", "customer id",
+        "user id", "account id", "employee id", "ticket id", "booking id",
+        "claim id", "record id", "medical record number", "mrn",
+    )
+    lookup = {_normal_name(column): column for column in df.columns}
+    for name in exact:
+        if name in lookup:
+            return lookup[name]
+    for normalized, column in lookup.items():
+        tokens = normalized.split()
+        if "id" in tokens and len(tokens) >= 2:
+            return column
+    return None
+
+
+def _pct_change(current, previous):
+    if previous is None or pd.isna(previous) or float(previous) == 0:
+        return None
+    return (float(current) / float(previous) - 1) * 100
+
+
+def _material_direction(value, threshold=2.0):
+    if value is None or pd.isna(value) or abs(float(value)) < threshold:
+        return "stable"
+    return "up" if value > 0 else "down"
+
+
+def _normalized_hhi(shares: pd.Series) -> float:
+    """Return 0 for an equal split and 1 for full concentration."""
+    shares = pd.to_numeric(shares, errors="coerce").dropna()
+    shares = shares[shares >= 0]
+    if len(shares) < 2 or shares.sum() == 0:
+        return 0.0
+    proportions = shares / shares.sum()
+    hhi = float((proportions ** 2).sum())
+    equal_hhi = 1 / len(proportions)
+    return max(0.0, min(1.0, (hhi - equal_hhi) / (1 - equal_hhi)))
 
 
 def _format_value(value, column=None, decimals=1) -> str:
@@ -261,42 +283,65 @@ def _time_evidence(df, date_col, metric):
 
     work["Period"] = work["Date"].dt.to_period("M")
     aggregation = "sum" if _is_additive_metric(metric) else "mean"
-    monthly = work.groupby("Period")["Value"].agg(aggregation).sort_index()
-    if len(monthly) < 2:
-        return {"monthly": monthly, "comparison_monthly": monthly, "growth": None}
+    monthly_frame = work.groupby("Period").agg(
+        Value=("Value", aggregation),
+        Records=("Value", "size"),
+        Average=("Value", "mean"),
+        FirstDate=("Date", "min"),
+        LastDate=("Date", "max"),
+        ActiveDates=("Date", "nunique"),
+    ).sort_index()
+    monthly = monthly_frame["Value"]
+    if len(monthly_frame) < 2:
+        return {
+            "monthly": monthly,
+            "comparison_monthly": monthly,
+            "monthly_frame": monthly_frame,
+            "comparison_frame": monthly_frame,
+            "growth": None,
+        }
 
     # Avoid treating an obviously incomplete final month as a decline. A month
     # is considered covered when the latest date reaches at least 90% of it.
-    latest_period_in_data = monthly.index[-1]
+    latest_period_in_data = monthly_frame.index[-1]
     latest_date = work["Date"].max()
     coverage = latest_date.day / latest_date.days_in_month
-    dates_per_month = work.groupby("Period")["Date"].nunique().sort_index()
+    dates_per_month = monthly_frame["ActiveDates"]
     typical_month_dates = float(dates_per_month.iloc[:-1].median()) if len(dates_per_month) > 1 else 0
-    comparison_monthly = monthly
+    comparison_frame = monthly_frame
     excluded_partial_period = None
-    if typical_month_dates >= 5 and coverage < 0.90 and len(monthly) >= 3:
-        comparison_monthly = monthly.iloc[:-1]
+    if typical_month_dates >= 5 and coverage < 0.90 and len(monthly_frame) >= 3:
+        comparison_frame = monthly_frame.iloc[:-1]
         excluded_partial_period = latest_period_in_data
 
-    previous_period = comparison_monthly.index[-2]
-    latest_period = comparison_monthly.index[-1]
-    previous = float(comparison_monthly.iloc[-2])
-    latest = float(comparison_monthly.iloc[-1])
-    growth = None if previous == 0 else (latest / previous - 1) * 100
+    comparison_monthly = comparison_frame["Value"]
+
+    previous_period = comparison_frame.index[-2]
+    latest_period = comparison_frame.index[-1]
+    previous = float(comparison_frame.iloc[-2]["Value"])
+    latest = float(comparison_frame.iloc[-1]["Value"])
+    growth = _pct_change(latest, previous)
+
+    previous_records = int(comparison_frame.iloc[-2]["Records"])
+    latest_records = int(comparison_frame.iloc[-1]["Records"])
+    record_growth = _pct_change(latest_records, previous_records)
+    previous_average = float(comparison_frame.iloc[-2]["Average"])
+    latest_average = float(comparison_frame.iloc[-1]["Average"])
+    average_growth = _pct_change(latest_average, previous_average)
 
     year_ago_period = latest_period - 12
     year_ago_value = (
-        float(comparison_monthly.loc[year_ago_period])
-        if year_ago_period in comparison_monthly.index else None
+        float(comparison_frame.loc[year_ago_period, "Value"])
+        if year_ago_period in comparison_frame.index else None
     )
-    year_over_year_growth = (
-        None if year_ago_value in (None, 0)
-        else (latest / year_ago_value - 1) * 100
-    )
+    year_over_year_growth = _pct_change(latest, year_ago_value)
 
     return {
         "monthly": monthly,
         "comparison_monthly": comparison_monthly,
+        "monthly_frame": monthly_frame,
+        "comparison_frame": comparison_frame,
+        "aggregation": aggregation,
         "growth": growth,
         "latest_period": latest_period,
         "previous_period": previous_period,
@@ -304,6 +349,12 @@ def _time_evidence(df, date_col, metric):
         "previous_label": _format_month(previous_period),
         "latest_value": latest,
         "previous_value": previous,
+        "latest_records": latest_records,
+        "previous_records": previous_records,
+        "record_growth": record_growth,
+        "latest_average": latest_average,
+        "previous_average": previous_average,
+        "average_growth": average_growth,
         "year_ago_period": year_ago_period if year_ago_value is not None else None,
         "year_ago_label": _format_month(year_ago_period) if year_ago_value is not None else None,
         "year_ago_value": year_ago_value,
@@ -312,7 +363,292 @@ def _time_evidence(df, date_col, metric):
     }
 
 
-def generate_decision_report(
+def _movement_interpretation(time_evidence, metric):
+    """Explain whether an additive movement came from volume or value."""
+    growth = time_evidence.get("growth")
+    if growth is None:
+        return "No comparable prior month is available."
+
+    if time_evidence.get("aggregation") != "sum":
+        return (
+            f"The latest monthly average changed by {growth:+.1f}%; compare it "
+            "with a target or business benchmark before treating it as good or bad."
+        )
+
+    volume = time_evidence.get("record_growth")
+    intensity = time_evidence.get("average_growth")
+    if volume is None or intensity is None:
+        return "The movement is verified, but its volume and per-record drivers are unavailable."
+
+    volume_direction = _material_direction(volume)
+    intensity_direction = _material_direction(intensity)
+    if volume_direction == "up" and intensity_direction == "down":
+        driver = (
+            "The increase was volume-led while value per record weakened."
+            if growth >= 0 else
+            "Higher record volume partially offset weaker value per record."
+        )
+    elif volume_direction == "down" and intensity_direction == "up":
+        driver = (
+            "Higher value per record offset lower record volume."
+            if growth >= 0 else
+            "The decline was volume-led despite stronger value per record."
+        )
+    elif volume_direction == "up" and intensity_direction == "up":
+        driver = "Both record volume and value per record improved, so the movement was broad-based."
+    elif volume_direction == "down" and intensity_direction == "down":
+        driver = "Both record volume and value per record declined, making the weakness broad-based."
+    elif abs(volume) >= abs(intensity):
+        driver = "Record volume was the larger observed driver of the movement."
+    else:
+        driver = f"Average {metric} per record was the larger observed driver of the movement."
+
+    return (
+        f"{driver} Record volume changed {volume:+.1f}% and average {metric} "
+        f"per record changed {intensity:+.1f}%."
+    )
+
+
+def _seasonality_finding(time_evidence, metric):
+    """Return only material, repeated seasonality or a material calendar effect."""
+    if not time_evidence:
+        return None
+    frame = time_evidence.get("comparison_frame")
+    if frame is None or len(frame) < 24:
+        return None
+
+    frame = frame.copy()
+    first_period = frame.index[0]
+    first_date = frame.iloc[0]["FirstDate"]
+    if first_date.day > 3:
+        frame = frame.iloc[1:]
+    if len(frame) < 24:
+        return None
+
+    frame["MonthNumber"] = frame.index.month
+    frame["Year"] = frame.index.year
+    frame["Days"] = frame.index.days_in_month
+    frame["NormalizedValue"] = (
+        frame["Value"] / frame["Days"]
+        if time_evidence.get("aggregation") == "sum"
+        else frame["Value"]
+    )
+
+    raw_summary = frame.groupby("MonthNumber")["Value"].agg(["mean", "count"])
+    normalized_summary = frame.groupby("MonthNumber")["NormalizedValue"].agg(["mean", "count"])
+    eligible = normalized_summary[normalized_summary["count"] >= 3]
+    if len(eligible) < 2:
+        return None
+
+    raw_eligible = raw_summary.loc[eligible.index]
+    raw_peak = int(raw_eligible["mean"].idxmax())
+    raw_weak = int(raw_eligible["mean"].idxmin())
+    raw_spread = _pct_change(raw_eligible.loc[raw_peak, "mean"], raw_eligible.loc[raw_weak, "mean"])
+    normalized_raw_spread = _pct_change(
+        normalized_summary.loc[raw_peak, "mean"],
+        normalized_summary.loc[raw_weak, "mean"],
+    )
+
+    if (
+        time_evidence.get("aggregation") == "sum"
+        and raw_spread is not None
+        and normalized_raw_spread is not None
+        and raw_spread >= 10
+        and normalized_raw_spread < 10
+    ):
+        occurrences = int(min(raw_eligible.loc[raw_peak, "count"], raw_eligible.loc[raw_weak, "count"]))
+        return {
+            "section": "Trends and Movement Drivers",
+            "title": "Calendar length explains most of the apparent monthly peak",
+            "evidence": (
+                f"Raw monthly {metric} averaged {_format_value(raw_eligible.loc[raw_peak, 'mean'], metric)} "
+                f"in {calendar.month_name[raw_peak]} versus "
+                f"{_format_value(raw_eligible.loc[raw_weak, 'mean'], metric)} in "
+                f"{calendar.month_name[raw_weak]} ({raw_spread:.1f}% higher). After dividing by "
+                f"calendar days, the difference falls to {normalized_raw_spread:.1f}% across "
+                f"{occurrences} comparable observations per month."
+            ),
+            "meaning": (
+                "The raw monthly ranking is not strong evidence of seasonality; month length and "
+                "record volume must be separated before operational planning."
+            ),
+            "type": "calendar_effect",
+            "confidence": "High",
+            "materiality": abs(raw_spread - normalized_raw_spread),
+        }
+
+    peak_month = int(eligible["mean"].idxmax())
+    weak_month = int(eligible["mean"].idxmin())
+    spread = _pct_change(eligible.loc[peak_month, "mean"], eligible.loc[weak_month, "mean"])
+    paired = frame[frame["MonthNumber"].isin([peak_month, weak_month])].pivot_table(
+        index="Year",
+        columns="MonthNumber",
+        values="NormalizedValue",
+        aggfunc="mean",
+    ).dropna()
+    repeat_rate = (
+        float((paired[peak_month] > paired[weak_month]).mean())
+        if len(paired) >= 3 else 0.0
+    )
+    if spread is None or spread < 12 or repeat_rate < 0.67:
+        return None
+
+    unit = "average per calendar day" if time_evidence.get("aggregation") == "sum" else "monthly average"
+    return {
+        "section": "Trends and Movement Drivers",
+        "title": f"A repeated {calendar.month_name[peak_month]} seasonal signal is visible",
+        "evidence": (
+            f"The {unit} for {metric} was {spread:.1f}% higher in "
+            f"{calendar.month_name[peak_month]} than {calendar.month_name[weak_month]}, and the "
+            f"relationship repeated in {repeat_rate:.0%} of {len(paired)} comparable years."
+        ),
+        "meaning": (
+            "This is a repeatable descriptive pattern, but business events and operational "
+            "context are still required before treating it as causal."
+        ),
+        "type": "seasonality",
+        "peak_month": calendar.month_name[peak_month],
+        "confidence": "Medium",
+        "materiality": spread,
+    }
+
+
+def _segment_structure_finding(df, metric, dimension):
+    if not metric or not dimension or dimension not in df.columns:
+        return None
+    work = pd.DataFrame({
+        "Dimension": df[dimension],
+        "Value": pd.to_numeric(df[metric], errors="coerce"),
+    }).dropna()
+    if work.empty or not 2 <= work["Dimension"].nunique() <= 50:
+        return None
+
+    grouped = work.groupby("Dimension").agg(
+        Total=("Value", "sum"),
+        Records=("Value", "size"),
+        Average=("Value", "mean"),
+    )
+    min_records = max(5, int(len(work) * 0.005))
+    reliable = grouped[grouped["Records"] >= min_records]
+    if len(reliable) < 2:
+        return None
+
+    if _is_additive_metric(metric) and reliable["Total"].sum() > 0:
+        shares = reliable["Total"] / reliable["Total"].sum() * 100
+        ordered_shares = shares.sort_values(ascending=False)
+        leader = ordered_shares.index[0]
+        concentration = _normalized_hhi(reliable["Total"])
+        if concentration >= 0.25:
+            return {
+                "section": "Segments and Concentration",
+                "title": f"{metric} is materially concentrated in {leader}",
+                "evidence": (
+                    f"{leader} represents {ordered_shares.iloc[0]:.1f}% of {metric}; the "
+                    f"normalized concentration score is {concentration:.2f} across "
+                    f"{len(reliable)} reliable {dimension} groups."
+                ),
+                "meaning": "Performance depends disproportionately on one segment, creating dependency risk.",
+                "type": "concentration",
+                "leader": str(leader),
+                "dimension": str(dimension),
+                "confidence": "High",
+                "materiality": ordered_shares.iloc[0],
+            }
+
+    ordered_average = reliable["Average"].sort_values(ascending=False)
+    top_name, low_name = ordered_average.index[0], ordered_average.index[-1]
+    average_gap = _pct_change(ordered_average.iloc[0], ordered_average.iloc[-1])
+    if average_gap is not None and average_gap >= 10:
+        return {
+            "section": "Segments and Concentration",
+            "title": f"Average {metric} differs materially across {dimension}",
+            "evidence": (
+                f"{top_name} averages {_format_value(ordered_average.iloc[0], metric)} per record, "
+                f"versus {_format_value(ordered_average.iloc[-1], metric)} for {low_name} "
+                f"({average_gap:.1f}% higher); both groups meet the minimum sample threshold."
+            ),
+            "meaning": "The difference is material, but mix and context should be checked before assigning causality.",
+            "type": "segment_gap",
+            "leader": str(top_name),
+            "dimension": str(dimension),
+            "confidence": "Medium",
+            "materiality": average_gap,
+        }
+
+    if _is_additive_metric(metric):
+        shares = reliable["Total"] / reliable["Total"].sum() * 100
+        share_range = float(shares.max() - shares.min())
+        average_range = float(
+            (reliable["Average"].max() / reliable["Average"].min() - 1) * 100
+        ) if reliable["Average"].min() != 0 else None
+        if share_range <= 5 and average_range is not None and average_range < 5:
+            return {
+                "section": "Segments and Concentration",
+                "title": f"{metric} is broadly balanced across {dimension}",
+                "evidence": (
+                    f"Group contributions range from {shares.min():.1f}% to {shares.max():.1f}%, "
+                    f"while average {metric} per record differs by only {average_range:.1f}%."
+                ),
+                "meaning": "No segment is large or different enough to justify a concentration-risk claim.",
+                "type": "balanced_segments",
+                "dimension": str(dimension),
+                "confidence": "High",
+                "materiality": 5 - share_range,
+            }
+    return None
+
+
+def _latest_segment_driver(df, date_col, metric, dimension, time_evidence):
+    if (
+        not time_evidence or time_evidence.get("growth") is None
+        or not _is_additive_metric(metric) or not dimension
+    ):
+        return None
+    dates = pd.to_datetime(df[date_col], errors="coerce")
+    values = pd.to_numeric(df[metric], errors="coerce")
+    work = pd.DataFrame({"Date": dates, "Value": values, "Dimension": df[dimension]}).dropna()
+    work["Period"] = work["Date"].dt.to_period("M")
+    periods = [time_evidence["previous_period"], time_evidence["latest_period"]]
+    cut = work[work["Period"].isin(periods)]
+    if cut.empty:
+        return None
+    pivot = cut.pivot_table(
+        index="Dimension",
+        columns="Period",
+        values="Value",
+        aggfunc="sum",
+        fill_value=0,
+    )
+    if not all(period in pivot.columns for period in periods):
+        return None
+    delta = pivot[periods[1]] - pivot[periods[0]]
+    if delta.abs().sum() == 0:
+        return None
+    total_delta = float(delta.sum())
+    same_direction = delta[delta * total_delta > 0] if total_delta != 0 else delta
+    if same_direction.empty:
+        return None
+    driver = same_direction.abs().idxmax()
+    driver_delta = float(delta.loc[driver])
+    gross_share = abs(driver_delta) / float(delta.abs().sum()) * 100
+    return {
+        "section": "Key Drivers and Relationships",
+        "title": f"{driver} was the largest observed {dimension} contributor to the latest movement",
+        "evidence": (
+            f"{driver}'s {metric} changed by {_format_value(driver_delta, metric)} from "
+            f"{time_evidence['previous_label']} to {time_evidence['latest_label']}, representing "
+            f"{gross_share:.1f}% of gross absolute movement across {dimension}."
+        ),
+        "meaning": "This identifies where the movement occurred; it does not by itself establish why it occurred.",
+        "type": "segment_driver",
+        "segment": str(driver),
+        "dimension": str(dimension),
+        "confidence": "High",
+        "materiality": gross_share,
+    }
+
+
+def _generate_decision_report_legacy(
     df: pd.DataFrame,
     quality_report: dict | None = None,
     max_findings: int = 7,
@@ -726,7 +1062,12 @@ def generate_decision_report(
         if item["action"] not in seen_actions:
             seen_actions.add(item["action"])
             unique_recommendations.append(item)
-    recommendations = unique_recommendations[:max_recommendations]
+    recommendation_priority = {"High": 3, "Medium": 2, "Low": 1}
+    recommendations = sorted(
+        unique_recommendations,
+        key=lambda item: recommendation_priority.get(item["priority"], 0),
+        reverse=True,
+    )[:max_recommendations]
 
     if not recommendations:
         recommendations.append({
@@ -764,6 +1105,490 @@ def generate_decision_report(
     }
 
 
+def generate_decision_report(
+    df: pd.DataFrame,
+    quality_report: dict | None = None,
+    max_findings: int = 7,
+    max_recommendations: int = 5,
+) -> dict:
+    """Build a materiality-gated, driver-aware report for an arbitrary table."""
+    rows, columns = df.shape
+    date_col = detect_date_column(df)
+    metrics = _business_metrics(df)
+    dimensions = _important_dimensions(df, date_col)
+    entity_id = _entity_identifier(df)
+
+    preferred_metric = _named_column(
+        df,
+        ["revenue", "sales", "profit", "billing amount", "amount", "quantity", "units"],
+    )
+    if preferred_metric not in metrics:
+        preferred_metric = metrics[0] if metrics else None
+    primary_dimension = dimensions[0] if dimensions else None
+
+    valid_dates = (
+        pd.to_datetime(df[date_col], errors="coerce").dropna()
+        if date_col else pd.Series(dtype="datetime64[ns]")
+    )
+    time_period = (
+        f"{valid_dates.min().strftime('%d %B %Y')} to "
+        f"{valid_dates.max().strftime('%d %B %Y')}"
+        if not valid_dates.empty else "No reliable date range is available"
+    )
+
+    monetary_metrics = [
+        metric for metric in metrics
+        if any(word in _normal_name(metric) for word in (
+            "sales", "revenue", "profit", "cost", "amount", "income", "price"
+        ))
+    ]
+    overview = {
+        "records": rows,
+        "columns": columns,
+        "date_column": date_col,
+        "time_period": time_period,
+        "dimensions": dimensions[:6],
+        "metrics": metrics[:6],
+        "grain": (
+            f"One row per observed record; `{entity_id}` is the available identifier."
+            if entity_id else
+            "One row is treated as one record; no reliable entity identifier was detected."
+        ),
+        "note": (
+            "Monetary currency is not specified; monetary values are shown in dataset units."
+            if monetary_metrics else None
+        ),
+    }
+
+    revenue = _named_column(df, ["revenue", "sales", "net sales"])
+    profit = _named_column(df, ["profit", "net profit", "gross profit"])
+    quantity = _named_column(df, ["quantity", "units sold", "units", "volume"])
+    order_id = _named_column(df, ["order id", "order number", "transaction id", "invoice id"])
+
+    # KPI summary: totals for additive measures, averages for intensity, and a
+    # count whose basis is explicit. This avoids treating identifiers as KPIs.
+    kpis = []
+    added_metrics = set()
+    for metric in (revenue, profit, quantity, preferred_metric):
+        if metric not in metrics or metric in added_metrics:
+            continue
+        numeric = pd.to_numeric(df[metric], errors="coerce").dropna()
+        if numeric.empty:
+            continue
+        if _is_additive_metric(metric):
+            kpis.append({
+                "name": f"Total {metric}",
+                "value": _format_value(numeric.sum(), metric),
+                "context": "Before any unapproved cleaning adjustments",
+            })
+            kpis.append({
+                "name": f"Average {metric} per Record",
+                "value": _format_value(numeric.mean(), metric),
+                "context": f"Based on {len(numeric):,} non-null records",
+            })
+        else:
+            kpis.append({
+                "name": f"Average {metric}",
+                "value": _format_value(numeric.mean(), metric),
+                "context": f"Based on {len(numeric):,} non-null records",
+            })
+        added_metrics.add(metric)
+
+    if revenue in metrics and profit in metrics and revenue != profit:
+        total_revenue = pd.to_numeric(df[revenue], errors="coerce").sum()
+        total_profit = pd.to_numeric(df[profit], errors="coerce").sum()
+        if total_revenue:
+            kpis.append({
+                "name": "Profit Margin",
+                "value": f"{total_profit / total_revenue * 100:.1f}%",
+                "context": f"Total {profit} divided by total {revenue}",
+            })
+
+    if revenue in metrics and order_id in df.columns:
+        distinct_orders = int(df[order_id].nunique(dropna=True))
+        if distinct_orders:
+            total_revenue = pd.to_numeric(df[revenue], errors="coerce").sum()
+            kpis.append({
+                "name": f"Average {revenue} per Order",
+                "value": _format_value(total_revenue / distinct_orders, revenue),
+                "context": f"Based on {distinct_orders:,} distinct {order_id} values",
+            })
+
+    time_evidence = _time_evidence(df, date_col, preferred_metric)
+    if time_evidence and time_evidence.get("growth") is not None:
+        kpis.append({
+            "name": f"Latest Monthly {preferred_metric} Change",
+            "value": f"{time_evidence['growth']:+.1f}%",
+            "context": f"{time_evidence['latest_label']} versus {time_evidence['previous_label']}",
+        })
+
+    findings = []
+
+    if time_evidence and time_evidence.get("growth") is not None:
+        growth = float(time_evidence["growth"])
+        yoy = time_evidence.get("year_over_year_growth")
+        yoy_sentence = (
+            f" It was {'up' if yoy >= 0 else 'down'} {abs(yoy):.1f}% from "
+            f"{time_evidence['year_ago_label']}."
+            if yoy is not None else ""
+        )
+        interpretation = _movement_interpretation(time_evidence, preferred_metric)
+        if time_evidence.get("excluded_partial_period") is not None:
+            interpretation += (
+                f" {_format_month(time_evidence['excluded_partial_period'])} was excluded "
+                "because the available dates cover less than 90% of that month."
+            )
+        findings.append({
+            "section": "Trends and Movement Drivers",
+            "title": (
+                f"{time_evidence['latest_label']} {preferred_metric} "
+                f"{'increased' if growth > 0 else 'decreased' if growth < 0 else 'was unchanged'} "
+                f"{abs(growth):.1f}% month over month"
+            ),
+            "evidence": (
+                f"{preferred_metric} was {_format_value(time_evidence['latest_value'], preferred_metric)} "
+                f"versus {_format_value(time_evidence['previous_value'], preferred_metric)} in "
+                f"{time_evidence['previous_label']} ({growth:+.1f}%).{yoy_sentence}"
+            ),
+            "meaning": interpretation,
+            "type": "decline" if growth < -2 else "growth" if growth > 2 else "stable",
+            "confidence": "High",
+            "materiality": abs(growth),
+            "average_growth": time_evidence.get("average_growth"),
+            "record_growth": time_evidence.get("record_growth"),
+        })
+
+        seasonal = _seasonality_finding(time_evidence, preferred_metric)
+        if seasonal:
+            findings.append(seasonal)
+
+        driver = _latest_segment_driver(
+            df,
+            date_col,
+            preferred_metric,
+            primary_dimension,
+            time_evidence,
+        )
+        if driver:
+            findings.append(driver)
+
+    segment_finding = _segment_structure_finding(df, preferred_metric, primary_dimension)
+    if segment_finding:
+        findings.append(segment_finding)
+
+    discount = _named_column(df, ["discount", "discount rate"])
+    if discount in metrics and profit in metrics and discount != profit:
+        pair = df[[discount, profit]].apply(pd.to_numeric, errors="coerce").dropna()
+        if len(pair) >= 30 and pair[discount].nunique() > 1 and pair[profit].nunique() > 1:
+            correlation = float(pair[discount].corr(pair[profit]))
+            if pd.notna(correlation) and abs(correlation) >= 0.20:
+                strength = "strong" if abs(correlation) >= .7 else "moderate" if abs(correlation) >= .4 else "weak"
+                findings.append({
+                    "section": "Key Drivers and Relationships",
+                    "title": f"{discount} and {profit} show a {strength} relationship",
+                    "evidence": (
+                        f"Pearson correlation is {correlation:.2f} across {len(pair):,} complete records."
+                    ),
+                    "meaning": "This is an association, not proof that changing one field will cause the other to change.",
+                    "type": "negative_correlation" if correlation < 0 else "correlation",
+                    "confidence": "Medium",
+                    "materiality": abs(correlation) * 100,
+                })
+
+    # Negative values are handled according to the metric's meaning. Profit
+    # can legitimately be negative; other additive measures need a business-
+    # rule check for returns, credits, adjustments, or invalid records.
+    if preferred_metric in metrics and _is_additive_metric(preferred_metric):
+        primary_values = pd.to_numeric(df[preferred_metric], errors="coerce")
+        negative_mask = primary_values < 0
+        if negative_mask.any():
+            negative_rows = int(negative_mask.sum())
+            negative_total = float(primary_values[negative_mask].sum())
+            is_profit = preferred_metric == profit
+            findings.append({
+                "section": "Anomalies and Data Trust",
+                "title": "Loss-making records" if is_profit else f"Negative {preferred_metric} values require validation",
+                "evidence": (
+                    f"{negative_rows:,} records ({negative_rows / max(rows, 1) * 100:.2f}%) contain "
+                    f"negative {preferred_metric}, totalling {_format_value(negative_total, preferred_metric)}."
+                ),
+                "meaning": (
+                    "These records directly reduce reported profit and should be segmented by their business drivers."
+                    if is_profit else
+                    "Confirm whether these are valid returns, refunds, credits, or adjustments; otherwise they may be data errors."
+                ),
+                "type": "loss_risk" if is_profit else "negative_values",
+                "confidence": "High",
+                "materiality": negative_rows / max(rows, 1) * 100,
+            })
+
+    duplicate_rows = int(df.duplicated().sum())
+    if duplicate_rows:
+        duplicate_rate = duplicate_rows / max(rows, 1) * 100
+        if preferred_metric in metrics and _is_additive_metric(preferred_metric):
+            raw_total = pd.to_numeric(df[preferred_metric], errors="coerce").sum()
+            deduplicated = df.drop_duplicates()
+            clean_total = pd.to_numeric(deduplicated[preferred_metric], errors="coerce").sum()
+            impact = float(raw_total - clean_total)
+            impact_pct = abs(impact / clean_total * 100) if clean_total else None
+            impact_text = (
+                f" They change total {preferred_metric} by {_format_value(impact, preferred_metric)} "
+                f"({impact_pct:.2f}% versus the deduplicated total)."
+                if impact_pct is not None else ""
+            )
+        else:
+            impact_pct = duplicate_rate
+            impact_text = ""
+        findings.append({
+            "section": "Anomalies and Data Trust",
+            "title": "Exact duplicates affect reported results",
+            "evidence": (
+                f"The dataset contains {duplicate_rows:,} duplicate copies ({duplicate_rate:.2f}% of rows)."
+                f"{impact_text}"
+            ),
+            "meaning": "Approve a deduplication rule and rerun the report before using totals operationally.",
+            "type": "duplicate_impact",
+            "confidence": "High",
+            "materiality": impact_pct,
+        })
+
+    if quality_report:
+        missing_cells = int(quality_report.get("missing_cells") or 0)
+        type_issues = quality_report.get("incorrect_types")
+        type_issue_count = len(type_issues) if isinstance(type_issues, pd.DataFrame) else 0
+        if missing_cells or type_issue_count:
+            parts = []
+            if missing_cells:
+                parts.append(f"{missing_cells:,} missing cells")
+            if type_issue_count:
+                parts.append(f"{type_issue_count} likely type issues")
+            findings.append({
+                "section": "Anomalies and Data Trust",
+                "title": "Completeness or type issues may affect analysis coverage",
+                "evidence": "The quality scan found " + " and ".join(parts) + ".",
+                "meaning": "Review affected KPI and dimension columns before interpreting comparisons.",
+                "type": "data_quality",
+                "confidence": "High",
+                "materiality": missing_cells / max(rows * columns, 1) * 100,
+            })
+
+    category = _dimension_column(df, ["category", "segment", "product"])
+    if revenue in metrics and profit in metrics and category:
+        margin = df.groupby(category)[[revenue, profit]].sum().dropna()
+        margin = margin[margin[revenue] != 0]
+        if len(margin) >= 2:
+            margin["Margin"] = margin[profit] / margin[revenue] * 100
+            low, high = margin["Margin"].idxmin(), margin["Margin"].idxmax()
+            gap = float(margin.loc[high, "Margin"] - margin.loc[low, "Margin"])
+            if gap >= 5:
+                findings.append({
+                    "section": "Business Opportunities",
+                    "title": "A material segment margin gap is visible",
+                    "evidence": (
+                        f"{low} has {margin.loc[low, 'Margin']:.1f}% margin versus "
+                        f"{high} at {margin.loc[high, 'Margin']:.1f}% ({gap:.1f} percentage-point gap)."
+                    ),
+                    "meaning": "Pricing, discount, cost, and mix differences should be compared before pursuing more volume.",
+                    "type": "low_margin",
+                    "segment": str(low),
+                    "confidence": "High",
+                    "materiality": gap,
+                })
+
+    priority = {
+        "duplicate_impact": 110,
+        "loss_risk": 105,
+        "negative_values": 100,
+        "decline": 95,
+        "low_margin": 92,
+        "segment_driver": 90,
+        "growth": 85,
+        "concentration": 82,
+        "data_quality": 80,
+        "calendar_effect": 78,
+        "seasonality": 75,
+        "segment_gap": 70,
+        "negative_correlation": 68,
+        "stable": 50,
+        "balanced_segments": 45,
+        "correlation": 40,
+    }
+    section_order = {
+        "Trends and Movement Drivers": 1,
+        "Segments and Concentration": 2,
+        "Key Drivers and Relationships": 3,
+        "Anomalies and Data Trust": 4,
+        "Business Opportunities": 5,
+    }
+    findings = sorted(
+        sorted(
+            findings,
+            key=lambda item: (priority.get(item["type"], 0), item.get("materiality") or 0),
+            reverse=True,
+        )[:max_findings],
+        key=lambda item: section_order.get(item["section"], 99),
+    )
+
+    recommendations = []
+    for finding in findings:
+        kind = finding["type"]
+        if kind == "duplicate_impact":
+            recommendations.append({
+                "priority": "High",
+                "action": "Approve and apply an exact-duplicate handling rule before publishing KPIs.",
+                "evidence": finding["evidence"],
+                "impact": "Removes a quantified source of KPI inflation or double counting.",
+                "next_step": "Review duplicate pairs, confirm whether they are repeated loads or valid events, then regenerate the report.",
+                "kpi": f"Deduplicated {preferred_metric}" if preferred_metric else "Duplicate row rate",
+                "confidence": "High",
+            })
+        elif kind in ("negative_values", "loss_risk"):
+            recommendations.append({
+                "priority": "High" if kind == "loss_risk" else "Medium",
+                "action": f"Define and validate the business rule for negative {preferred_metric} values.",
+                "evidence": finding["evidence"],
+                "impact": "Separates legitimate adjustments or losses from data errors and improves KPI trust.",
+                "next_step": f"Classify negative {preferred_metric} records by reason and report them separately from ordinary activity.",
+                "kpi": f"Negative-{preferred_metric} record rate",
+                "confidence": "High",
+            })
+        elif kind in ("growth", "decline"):
+            average_growth = finding.get("average_growth")
+            if average_growth is not None and average_growth < -2:
+                action = f"Investigate the decline in average {preferred_metric} per record before treating total growth as improvement."
+            else:
+                action = f"Validate the latest {preferred_metric} movement by segment and confirm whether it persists."
+            recommendations.append({
+                "priority": "High" if kind == "decline" else "Medium",
+                "action": action,
+                "evidence": finding["evidence"],
+                "impact": "Distinguishes volume, value, and mix effects before changing forecasts or operations.",
+                "next_step": f"Compare record count and average {preferred_metric} per record by {primary_dimension or 'the strongest available dimension'}.",
+                "kpi": f"Monthly total and average {preferred_metric} per record",
+                "confidence": "High",
+            })
+        elif kind == "segment_driver":
+            recommendations.append({
+                "priority": "Medium",
+                "action": f"Investigate the business events and mix behind the change in {finding.get('segment')}.",
+                "evidence": finding["evidence"],
+                "impact": "Focuses follow-up on the segment where the verified movement was largest.",
+                "next_step": f"Compare volume and average {preferred_metric} per record for {finding.get('segment')} across the two periods.",
+                "kpi": f"{finding.get('segment')} monthly {preferred_metric}",
+                "confidence": "Medium",
+            })
+        elif kind == "concentration":
+            recommendations.append({
+                "priority": "Medium",
+                "action": f"Assess dependency on {finding.get('leader')} and define an acceptable concentration threshold.",
+                "evidence": finding["evidence"],
+                "impact": "Makes concentration risk measurable instead of assuming that every leading segment is risky.",
+                "next_step": "Compare concentration over time and test downside scenarios for the leading segment.",
+                "kpi": "Top-segment share and normalized concentration score",
+                "confidence": "High",
+            })
+        elif kind == "low_margin":
+            recommendations.append({
+                "priority": "High",
+                "action": f"Review price, discount, cost, and mix for {finding.get('segment')}.",
+                "evidence": finding["evidence"],
+                "impact": "Targets a measured margin gap rather than pursuing volume without profitability context.",
+                "next_step": "Reconcile segment revenue and profit, then compare unit economics with the highest-margin segment.",
+                "kpi": "Segment profit margin",
+                "confidence": "High",
+            })
+        elif kind == "seasonality":
+            recommendations.append({
+                "priority": "Low",
+                "action": "Validate the repeated seasonal signal against business events before using it for planning.",
+                "evidence": finding["evidence"],
+                "impact": "Prevents calendar patterns from being mistaken for causal demand signals.",
+                "next_step": "Compare the pattern by year and material segment, then document known operational causes.",
+                "kpi": f"Calendar-normalized monthly {preferred_metric}",
+                "confidence": "Medium",
+            })
+        elif kind == "data_quality":
+            recommendations.append({
+                "priority": "Medium",
+                "action": "Resolve quality issues in fields used by the report before operational use.",
+                "evidence": finding["evidence"],
+                "impact": "Improves coverage and prevents avoidable calculation bias.",
+                "next_step": "Review the Data Quality page and record every accepted cleaning rule.",
+                "kpi": "Dataset health score",
+                "confidence": "High",
+            })
+
+    unique_recommendations = []
+    seen_actions = set()
+    for item in recommendations:
+        if item["action"] not in seen_actions:
+            seen_actions.add(item["action"])
+            unique_recommendations.append(item)
+    recommendation_priority = {"High": 3, "Medium": 2, "Low": 1}
+    recommendations = sorted(
+        unique_recommendations,
+        key=lambda item: recommendation_priority.get(item["priority"], 0),
+        reverse=True,
+    )[:max_recommendations]
+    if not recommendations:
+        recommendations = [{
+            "priority": "Low",
+            "action": "Add a target, benchmark, and business decision before requesting prescriptive recommendations.",
+            "evidence": "No material risk, driver, or opportunity passed the automatic evidence thresholds.",
+            "impact": "Prevents generic advice from being presented as a data-backed action.",
+            "next_step": "Define the outcome, comparison baseline, and decision owner, then regenerate the report.",
+            "kpi": preferred_metric or "Selected decision KPI",
+            "confidence": "High",
+        }]
+
+    limitations = []
+    if not entity_id:
+        limitations.append(
+            "No reliable entity identifier was detected. Counts represent dataset rows and must not be described as unique customers, patients, orders, or other entities."
+        )
+    if monetary_metrics:
+        limitations.append(
+            "Currency and accounting meaning are not supplied. Amounts must not automatically be described as collected revenue, cash, or profit."
+        )
+    high_cardinality = []
+    for column in df.select_dtypes(exclude="number").columns:
+        unique = int(df[column].nunique(dropna=True))
+        if rows and unique >= 50 and unique / rows >= 0.50:
+            high_cardinality.append(str(column))
+    if high_cardinality:
+        limitations.append(
+            "High-cardinality fields were excluded from automatic leader claims without stronger identifiers or minimum sample support: "
+            + ", ".join(high_cardinality[:5]) + "."
+        )
+    limitations.append(
+        "No external target, benchmark, causal context, or operational constraint was supplied; recommendations are prioritized hypotheses, not proven interventions."
+    )
+
+    questions = []
+    if time_evidence and primary_dimension:
+        questions.append(f"Which {primary_dimension} values explain the latest change in {preferred_metric}, after separating record volume from average value?")
+    if duplicate_rows:
+        questions.append("How materially do KPIs and rankings change after the approved deduplication rule?")
+    if preferred_metric in metrics and (pd.to_numeric(df[preferred_metric], errors="coerce") < 0).any():
+        questions.append(f"What business events explain negative {preferred_metric} values?")
+    if revenue in metrics and profit in metrics and primary_dimension:
+        questions.append(f"Which {primary_dimension} groups combine scale with sustainable profit margin?")
+    if date_col:
+        questions.append("Does the calendar-normalized pattern repeat by year and material segment?")
+    questions = list(dict.fromkeys(questions))[:5]
+
+    return {
+        "overview": overview,
+        "kpis": kpis[:6],
+        "findings": findings,
+        "recommendations": recommendations,
+        "limitations": limitations,
+        "questions": questions,
+        "primary_metric": preferred_metric,
+        "primary_dimension": primary_dimension,
+    }
+
+
 def report_to_markdown(report: dict, title: str = "DataSense AI Business Insights Report") -> str:
     """Convert the grounded report into editable Markdown."""
     overview = report["overview"]
@@ -772,6 +1597,8 @@ def report_to_markdown(report: dict, title: str = "DataSense AI Business Insight
     lines.append(f"- **Available period:** {overview['time_period']}")
     lines.append("- **Important dimensions:** " + (", ".join(map(str, overview["dimensions"])) or "No reliable business dimensions identified"))
     lines.append("- **Business metrics:** " + (", ".join(map(str, overview["metrics"])) or "No numeric business metrics identified"))
+    if overview.get("grain"):
+        lines.append(f"- **Counting basis:** {overview['grain']}")
     if overview.get("note"):
         lines.append(f"- **Note:** {overview['note']}")
 
@@ -790,22 +1617,28 @@ def report_to_markdown(report: dict, title: str = "DataSense AI Business Insight
         lines.append(f"- **{finding['title']}**")
         lines.append(f"  {finding['evidence']}")
         if finding.get("meaning"):
-            lines.append(f"  **Why it matters:** {finding['meaning']}")
+            lines.append(f"  **Interpretation:** {finding['meaning']}")
+        if finding.get("confidence"):
+            lines.append(f"  **Confidence:** {finding['confidence']}")
 
     lines.extend([
         "", "## 4. Recommendations & Next Steps", "",
-        "| Priority | Recommended action | Supporting evidence | Expected impact | Specific next step | KPI to monitor |",
-        "|---|---|---|---|---|---|",
+        "| Priority | Recommended action | Supporting evidence | Expected impact | Specific next step | KPI to monitor | Confidence |",
+        "|---|---|---|---|---|---|---|",
     ])
     for item in report["recommendations"]:
         cells = [
             item["priority"], item["action"], item["evidence"], item["impact"],
-            item["next_step"], item["kpi"],
+            item["next_step"], item["kpi"], item.get("confidence", "Medium"),
         ]
         cells = [str(cell).replace("|", "/").replace("\n", " ") for cell in cells]
         lines.append("| " + " | ".join(cells) + " |")
 
-    lines.extend(["", "## 5. Questions for Further Analysis", ""])
+    lines.extend(["", "## 5. Limitations and Trust Notes", ""])
+    for limitation in report.get("limitations", []):
+        lines.append(f"- {limitation}")
+
+    lines.extend(["", "## 6. Questions for Further Analysis", ""])
     for question in report["questions"]:
         lines.append(f"- {question}")
 

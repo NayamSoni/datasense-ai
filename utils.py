@@ -165,6 +165,28 @@ BUSINESS_SYNONYMS = {
 "lead": [
     "lead",
     "lead id"
+],
+
+"hospital": [
+    "hospital",
+    "hospital name",
+    "medical center",
+    "medical centre",
+    "health facility"
+],
+
+"facility": [
+    "facility",
+    "facility name",
+    "hospital",
+    "hospital name"
+],
+
+"provider": [
+    "provider",
+    "provider name",
+    "hospital",
+    "hospital name"
 ]
 }
 
@@ -473,7 +495,10 @@ def detect_dimension(df):
         "region",
         "state",
         "city",
-        "country"
+        "country",
+        "hospital",
+        "facility",
+        "provider"
     ]
 
     for item in priority:

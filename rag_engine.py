@@ -25,6 +25,25 @@ DEFAULT_EMBEDDING_MODEL = os.getenv(
 SUPPORTED_KNOWLEDGE_TYPES = ("pdf", "txt", "md", "csv")
 SUPPORTED_RETRIEVAL_BACKENDS = ("ollama", "tfidf")
 
+GENERIC_RETRIEVAL_WORDS = {
+    "average",
+    "calculate",
+    "calculated",
+    "calculation",
+    "define",
+    "definition",
+    "explain",
+    "formula",
+    "kpi",
+    "meaning",
+    "metric",
+    "number",
+    "percentage",
+    "rate",
+    "total",
+    "value",
+}
+
 DATA_DIRECTORY = Path(__file__).resolve().parent / "data"
 STARTER_GLOSSARY_CANDIDATES = (
     DATA_DIRECTORY / "kpi_glossary_10_industries.csv",
@@ -74,6 +93,49 @@ def _normalise_text(text: str) -> str:
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def _normalise_search_token(token: str) -> str:
+    """Apply small plural normalisation without adding an NLP dependency."""
+    token = token.casefold()
+    if len(token) > 4 and token.endswith("ies"):
+        return f"{token[:-3]}y"
+    if len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
+        return token[:-1]
+    return token
+
+
+def _search_tokens(text: str) -> set[str]:
+    """Return comparable word tokens for lexical relevance checks."""
+    return {
+        _normalise_search_token(token)
+        for token in re.findall(r"[a-zA-Z0-9]+", text)
+        if len(token) > 1
+    }
+
+
+def _query_anchor_tokens(question: str) -> set[str]:
+    """Keep the specific subject words and remove generic KPI phrasing."""
+    try:
+        from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+    except ImportError as exc:
+        raise KnowledgeBaseError(
+            "TF-IDF retrieval requires scikit-learn. "
+            "Run: pip install -r requirements.txt"
+        ) from exc
+
+    stop_words = {
+        _normalise_search_token(word)
+        for word in ENGLISH_STOP_WORDS
+    }
+    generic_words = {
+        _normalise_search_token(word)
+        for word in GENERIC_RETRIEVAL_WORDS
+    }
+    return _search_tokens(question).difference(
+        stop_words,
+        generic_words,
+    )
 
 
 def _decode_text(data: bytes) -> str:
@@ -451,8 +513,13 @@ def _retrieve_with_tfidf(
         return []
 
     scores = cosine_similarity(query, matrix).ravel()
+    anchor_tokens = _query_anchor_tokens(question)
     scored = []
     for chunk, score in zip(index["chunks"], scores):
+        if anchor_tokens and not anchor_tokens.intersection(
+            _search_tokens(chunk["text"])
+        ):
+            continue
         numeric_score = float(score)
         if numeric_score >= min_score:
             scored.append({**chunk, "score": numeric_score})
@@ -474,7 +541,7 @@ def retrieve_knowledge(
 
     backend = str(index.get("backend", "ollama")).strip().lower()
     if backend == "tfidf":
-        threshold = 0.05 if min_score is None else min_score
+        threshold = 0.15 if min_score is None else min_score
         return _retrieve_with_tfidf(
             question,
             index,
